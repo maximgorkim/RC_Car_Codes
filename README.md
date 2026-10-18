@@ -1,5 +1,12 @@
 # RC Autonomous Race Car — ROS 2 Workspace
 
+> **Fork of [memre12/RC_Car_Codes](https://github.com/memre12/RC_Car_Codes)** by
+> Mehmet Emre Demir ([@memre12](https://github.com/memre12)), who built the
+> original stack (drivers, particle filter setup, path/speed references,
+> lattice planner, pure pursuit and the MPC tracking controller).
+> This fork adds a **delay-compensated EKF localization** (`rc_localization`)
+> and its integration with the MPC — see [What this fork adds](#what-this-fork-adds).
+
 Autonomous driving stack for a 1/10-scale RC race car running on an
 **NVIDIA Jetson Xavier (16 GB)** with a YDLidar, a VESC motor controller
 and a particle-filter localization against a pre-built map.
@@ -35,6 +42,43 @@ Editable source: [`system_architecture.drawio`](docs/architecture/system_archite
 - **particle_filter**, **slam_toolbox** — localization / mapping.
 - **vesc**, **ydlidar_ros2_driver** — hardware drivers.
 - **race_car_launcher** — top-level launch files.
+
+## What this fork adds
+
+Branch `feature/ekf-localization` — Mehmet Görkem Keskin.
+
+The particle filter pose arrives ~0.2 s late and at ~8 Hz. The new
+**`rc_localization`** package fuses it with the ZED2 IMU and the VESC speed in an
+EKF with Autoware-style delay compensation and publishes a **50 Hz pose predicted
+to the present** on `/localization/odom` (same `nav_msgs/Odometry` interface).
+Details, parameters and results: [`src/rc_localization/README.md`](src/rc_localization/README.md).
+
+| Change | Where |
+|---|---|
+| EKF, twist estimator, monitors (`localization_monitor.py`, `live_status.py`), offline replay, 11 unit tests | `src/rc_localization/` (new) |
+| `localization:=pf\|ekf` (default `pf`), `v_max` / `a_lat_max` overrides | `mpc_tracking_controller/launch/mpc.launch.py` |
+| Optional EKF mode for the particle filter (`ekf:=true`, defaults unchanged, not yet tested on the car) | `particle_filter/` |
+| One-command Gazebo test: path + speed ref + EKF + MPC | `rc_localization/launch/sim_test.launch.py` |
+
+Results (Gazebo car-like mode, error against the true pose):
+
+| | PF as seen by the controller | EKF |
+|---|---|---|
+| Rate | 8.4 Hz | 50 Hz |
+| Pose age | ~266 ms | ~10 ms |
+| Position error mean / max | 26 / 54 cm | 7 / 19 cm |
+
+On 8 recorded car bags: max jump 5.6 cm, no resets. Builds and passes the tests on
+Foxy (`ros:foxy` Docker) and Humble. **Not yet driven on the real car.**
+
+```bash
+# car: EKF next to the existing stack, then the MPC on the EKF pose
+ros2 launch rc_localization ekf_localization.launch.py
+ros2 launch mpc_tracking_controller mpc.launch.py localization:=ekf
+```
+
+Measured on the bags: **1 m/s ≈ 2080 ERPM** at the VESC (`/sensors/core`); the
+computed 3365.4 below does not match the recorded data (the MPC uses 2171).
 
 ## Units convention
 
@@ -93,6 +137,17 @@ cd ~/RC_Car_Sim
 ./build.sh
 source install/setup.bash
 ros2 launch sim_pkg simulation_environment.launch.py
+```
+
+EKF + MPC test (RC_Car_Sim branch `car-like-mode`, see the
+[fork](https://github.com/maximgorkim/RC_Car_Sim/tree/car-like-mode) for `clock_rate`):
+
+```bash
+# container
+ros2 launch sim_pkg simulation_environment.launch.py vehicle:=car clock_rate:=1000
+# host
+ros2 launch rc_localization sim_test.launch.py                 # localization:=pf to compare
+ros2 run rc_localization live_status.py --ros-args -p use_sim_time:=true
 ```
 
 ## Tuning quick reference
