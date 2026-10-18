@@ -41,7 +41,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import String, Header, Float32MultiArray
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, PoseWithCovarianceStamped, PointStamped, TransformStamped
+from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, PoseWithCovarianceStamped, PointStamped, TransformStamped, TwistWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from nav_msgs.srv import GetMap
 qos = QoSProfile(depth=10)
@@ -100,6 +100,21 @@ class ParticleFiler(Node):
         self.PUBLISH_ODOM         = self.get_parameter('publish_odom').value
         self.DO_VIZ               = self.get_parameter('viz').value
 
+        # EKF integration (rc_localization). The defaults keep the original
+        # behaviour; config/localize_ekf.yaml switches all three:
+        #   publish_tf: false        the EKF publishes odom -> base_link
+        #   scan_synchronous: true   one MCL update per scan (no 10 Hz throttle),
+        #                            pose stamped with the scan time, so the EKF
+        #                            applies it at the time it was measured
+        #   motion_source: twist     motion model from the VESC + IMU twist
+        #                            (/localization/twist_with_cov) instead of ZED VO
+        self.PUBLISH_TF    = self.declare_parameter('publish_tf', True).value
+        self.SCAN_SYNC     = self.declare_parameter('scan_synchronous', False).value
+        self.MOTION_SOURCE = self.declare_parameter('motion_source', 'odom').value
+        self.TWIST_TOPIC   = self.declare_parameter('twist_topic', '/localization/twist_with_cov').value
+        if self.MOTION_SOURCE not in ('odom', 'twist'):
+            raise ValueError("motion_source must be 'odom' or 'twist'")
+
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
         self.Z_MAX     = self.get_parameter('z_max').value
@@ -130,6 +145,9 @@ class ParticleFiler(Node):
         self.first_sensor_update = True
         self.state_lock = Lock()
         self.last_mcl_time = 0.0
+        self.scan_stamp = None
+        self.last_twist_t = None
+        self.twist_theta = 0.0   # heading change since the last MCL update (twist motion source)
 
         # cache this to avoid memory allocation in motion model
         self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
@@ -178,11 +196,17 @@ class ParticleFiler(Node):
             self.get_parameter('scan_topic').value,
             self.lidarCB,
             qos)
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            self.get_parameter('odometry_topic').value,
-            self.odomCB,
-            1)
+        if self.MOTION_SOURCE == 'twist':
+            self.twist_sub = self.create_subscription(
+                TwistWithCovarianceStamped, self.TWIST_TOPIC, self.twistCB, qos)
+        else:
+            self.odom_sub = self.create_subscription(
+                Odometry,
+                self.get_parameter('odometry_topic').value,
+                self.odomCB,
+                1)
+        self.get_logger().info(
+            f'motion source: {self.MOTION_SOURCE}, scan synchronous: {self.SCAN_SYNC}, publish TF: {self.PUBLISH_TF}')
         self.pose_sub = self.create_subscription(
             PoseWithCovarianceStamped,
             '/initialpose',
@@ -258,11 +282,13 @@ class ParticleFiler(Node):
         t.transform.rotation.y = q[1]
         t.transform.rotation.z = q[2]
         t.transform.rotation.w = q[3]
-        self.pub_tf.sendTransform(t)
+        if self.PUBLISH_TF:
+            self.pub_tf.sendTransform(t)
 
         if self.PUBLISH_ODOM:
             odom = Odometry()
-            odom.header.stamp = self.get_clock().now().to_msg()
+            # scan_synchronous: the pose refers to the scan, stamp it with the scan time
+            odom.header.stamp = stamp if self.SCAN_SYNC else self.get_clock().now().to_msg()
             odom.header.frame_id = 'odom'
             odom.pose.pose.position.x = pose[0]
             odom.pose.pose.position.y = pose[1]
@@ -361,9 +387,10 @@ class ParticleFiler(Node):
 
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
+        self.scan_stamp = msg.header.stamp
         self.lidar_initialized = True
-        print("callback lidar")
-        # self.update()
+        if self.SCAN_SYNC:
+            self.update()
 
     def odomCB(self, msg):
         '''
@@ -396,7 +423,32 @@ class ParticleFiler(Node):
             self.last_pose = pose
 
         # this topic is slower than lidar, so update every time we receive a message
-        self.update()
+        if not self.SCAN_SYNC:
+            self.update()
+
+    def twistCB(self, msg):
+        '''
+        Motion source 'twist': integrate forward speed and yaw rate into the
+        displacement since the last MCL update, in the car frame of that update.
+        '''
+        t = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+        v = msg.twist.twist.linear.x
+        w = msg.twist.twist.angular.z
+        self.current_speed = v
+        if self.last_twist_t is not None:
+            dt = min(max(t - self.last_twist_t, 0.0), 0.1)
+            th = self.twist_theta + 0.5 * w * dt
+            self.odometry_data[0] += v * np.cos(th) * dt
+            self.odometry_data[1] += v * np.sin(th) * dt
+            self.odometry_data[2] += w * dt
+            self.twist_theta += w * dt
+            self.odom_initialized = True
+        else:
+            self.get_logger().info('...Received first twist message')
+        self.last_twist_t = t
+        self.last_stamp = msg.header.stamp
+        if not self.SCAN_SYNC:
+            self.update()
 
     def clicked_pose(self, msg):
         '''
@@ -680,9 +732,9 @@ class ParticleFiler(Node):
                 self.get_logger().info('Concurrency error avoided')
             else:
                 self.state_lock.acquire()
-                # Throttle update to 10Hz
+                # Throttle update to 10Hz (not in scan-synchronous mode: one update per scan)
                 current_time = self.get_clock().now().nanoseconds / 1e9
-                if (current_time - self.last_mcl_time) < 0.1:
+                if not self.SCAN_SYNC and (current_time - self.last_mcl_time) < 0.1:
                     self.state_lock.release()
                     return
                 
@@ -695,6 +747,7 @@ class ParticleFiler(Node):
                 observation = np.copy(self.downsampled_ranges).astype(np.float32)
                 action = np.copy(self.odometry_data)
                 self.odometry_data = np.zeros(3)
+                self.twist_theta = 0.0
 
                 # run the MCL update algorithm
                 self.MCL(action, observation)
@@ -705,7 +758,7 @@ class ParticleFiler(Node):
                 t2 = time.time()
 
                 # publish transformation frame based on inferred pose
-                self.publish_tf(self.inferred_pose, self.last_stamp)
+                self.publish_tf(self.inferred_pose, self.scan_stamp if self.SCAN_SYNC else self.last_stamp)
 
                 # this is for tracking particle filter speed
                 ips = 1.0 / (t2 - t1)

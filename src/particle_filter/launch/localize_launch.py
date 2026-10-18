@@ -24,6 +24,7 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.substitutions import LaunchConfiguration
 from launch.actions import DeclareLaunchArgument
+from launch.substitutions import PythonExpression
 from ament_index_python.packages import get_package_share_directory
 import os
 import yaml
@@ -41,14 +42,21 @@ def generate_launch_description():
         'localize_config',
         default_value=localize_config,
         description='Localization configs')
-    ld = LaunchDescription([localize_la])
+    # ekf:=true -> config/localize_ekf.yaml: no TF, one update per scan stamped with
+    # the scan time, motion from the VESC + IMU twist (pose source of rc_localization)
+    ekf_la = DeclareLaunchArgument('ekf', default_value='false',
+                                   description='true: localize_ekf.yaml (PF as the EKF pose source)')
+    ekf_config = os.path.join(get_package_share_directory('particle_filter'), 'config', 'localize_ekf.yaml')
+    config = PythonExpression(["'", ekf_config, "' if '", LaunchConfiguration('ekf'), "' == 'true' else '",
+                               LaunchConfiguration('localize_config'), "'"])
+    ld = LaunchDescription([localize_la, ekf_la])
 
     # nodes
     pf_node = Node(
         package='particle_filter',
         executable='particle_filter',
         name='particle_filter',
-        parameters=[LaunchConfiguration('localize_config')]
+        parameters=[config]
     )
     map_server_node = Node(
         package='nav2_map_server',
