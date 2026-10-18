@@ -1,0 +1,107 @@
+ekf_localizer:
+  ros__parameters:
+    # ---------------- topics / frames
+    twist_topic: /localization/twist_with_cov
+    # Today: the particle filter's Odometry, stamped with now() although the
+    # pose is older (see pose_stamp_offset). After the PF fix it becomes a
+    # PoseWithCovarianceStamped stamped with the scan time.
+    pose_topic: /pf/pose/odom
+    pose_msg_type: odometry          # odometry | pose_with_cov
+    initialpose_topic: /initialpose
+    imu_topic: /zed2/zed_node/imu/data   # lateral acceleration (model.lateral_dynamics only)
+    odom_topic: /localization/odom   # drop-in replacement for /pf/pose/odom
+    pose_out_topic: /localization/pose_with_cov
+    debug_topic: /localization/ekf/debug
+    # The planners / path use "odom" as the global frame today; keep it until
+    # the TF tree is moved to map -> odom -> base_link.
+    world_frame: odom
+    base_frame: base_link
+    publish_tf: true                 # the particle filter's TF must then be off
+
+    # ---------------- timing
+    output_rate: 50.0                # Hz, fixed, independent of the LiDAR
+    output_trigger: timer            # timer (car) | twist (Gazebo: /clock only advances at 10 Hz)
+    history_length: 1.0              # s, oldest measurement that can still be applied
+    max_extrapolation: 0.1           # s, prediction past the newest measurement
+    # Particle-filter latency MEASURED on the bags (PF yaw rate vs ZED gyro,
+    # cross-correlation): 160-220 ms; MPC identification: 200-239 ms.
+    pose_stamp_offset: 0.20
+    sensor_timeout: 0.5
+
+    # ---------------- measurement noise
+    use_pose_covariance: true        # PF particle spread: ~3 cm / 0.007 rad
+    pose_stddev_xy: 0.05             # used when use_pose_covariance is false
+    pose_stddev_yaw: 0.02
+    pose_min_stddev_xy: 0.03         # floors: PF jitter on the bags is ~2.5 cm
+    pose_min_stddev_yaw: 0.015
+    # Jitter of the LiDAR pose time [s]: inflates R along the motion by
+    # (speed * pose_time_stddev). The PF stamps with now() and its latency
+    # varies by ~+-40 ms (bags: along-track residual grows with speed, zero
+    # mean); 0.04 cut rejected poses from ~1 % to ~0.5 %. Use ~0.01 once the
+    # PF stamps with the scan time.
+    pose_time_stddev: 0.04
+    twist_min_stddev_vx: 0.05
+    twist_min_stddev_wz: 0.01
+    max_consecutive_rejections: 15   # ~2 s of rejected PF poses -> restart from the PF
+    # IMU lateral acceleration (model.lateral_dynamics only). CALIBRATED on the
+    # 8 bags: ZED accel y = 1.24 * v*wz - 0.37 m/s^2 (corr 0.92-0.95, every bag
+    # 1.13-1.29): the reading is divided by accel_scale; the offset (mounting
+    # tilt) is init.ay_bias = -0.37 / 1.24 and then tracked by the filter.
+    accel_scale: 1.24                # 1.0 in Gazebo (ideal IMU)
+    accel_sign: 1.0
+    accel_stddev: 1.0                # m/s^2, ZED vibration ~1 m/s^2 above 10 Hz
+
+    # ---------------- initial state
+    # Starting values = what the filter learned on the 2026-10-05 bags.
+    init:
+      yaw_bias: 0.05                 # learned 0.040-0.057 rad (MPC identification: 0.045)
+      gyro_bias: 0.0                 # learned -0.0005..0.002 rad/s
+      speed_scale: 1.0               # learned 0.996-1.019 with erpm_per_mps 2050 -> 2080 used
+      ay_bias: -0.30                 # m/s^2 after accel_scale (0.0 in Gazebo)
+      stddev_vy: 0.2
+      stddev_ay: 2.0
+      stddev_ay_bias: 0.5
+      stddev_xy: 0.1
+      stddev_yaw: 0.05
+      stddev_yaw_bias: 0.03
+      stddev_vx: 1.0
+      stddev_wz: 0.5
+      stddev_gyro_bias: 0.01
+      stddev_speed_scale: 0.05
+
+    # ---------------- model
+    model:
+      lever_arm: 0.17                # m, base_link (LiDAR) ahead of the rear axle; bag sweep 0-0.35: best 0.17
+      max_predict_dt: 0.01
+      # Side slip: lateral velocity state driven by the IMU lateral acceleration.
+      # Unit test (sliding car, 1.2 m/s slides at 7 m/s): error during slides
+      # 0.47 m -> 0.05 m. On the bags (<= 2.5 m/s, no slides): rejected poses
+      # 18 -> 12 but max jump 5.6 -> 11.7 cm, so OFF until the car drives fast
+      # enough to slide; launch with lateral_dynamics:=true for high speed.
+      lateral_dynamics: false
+      slip_tau: 2.0                  # s; NOT the slip decay (that is in the measured ay),
+                                     # only bounds accelerometer drift; 0.3 halves the slide tracking
+
+    # stddev per sqrt(s); Q = q^2 dt
+    process_noise:
+      pos: 0.02                      # 0.04 follows PF noise more closely (jumps up to 9 cm)
+      yaw: 0.005
+      yaw_bias: 0.002
+      vx: 4.0                        # m/s^2
+      wz: 6.0                        # rad/s^2
+      gyro_bias: 0.0005
+      speed_scale: 0.002
+      vy: 0.05                       # 0.2: bag jumps up to 18 cm
+      ay: 30.0
+      ay_bias: 0.01
+
+    gate:
+      pose: 16.27                    # chi2(3) 99.9 %
+      twist: 0.0                     # off
+
+    limits:
+      max_yaw_bias: 0.2
+      max_gyro_bias: 0.1
+      min_speed_scale: 0.7
+      max_speed_scale: 1.3
+      max_ay_bias: 2.0

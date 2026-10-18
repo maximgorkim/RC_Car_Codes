@@ -1,0 +1,19 @@
+twist_estimator:
+  ros__parameters:
+    vesc_state_topic: /sensors/core
+    imu_topic: /zed2/zed_node/imu/data
+    twist_topic: /localization/twist_with_cov
+    frame_id: base_link
+
+    # MEASURED on the 2026-10-05 bags (VESC ERPM vs particle-filter speed,
+    # 4 bags, 224-515 moving samples each): 2025-2108 ERPM per m/s.
+    # The theoretical 3365.4 of race_car_parameters.txt is ~1.65x too high.
+    # The EKF's speed_scale state then converged to 1.015 on 8 bags -> 2080.
+    erpm_per_mps: 2080.0
+    speed_sign: 1.0          # verified on the bags: forward driving gives ERPM > 0
+    yaw_rate_sign: 1.0       # verified on the bags: ZED gyro z matches the PF yaw rate
+    vesc_timeout: 0.1        # s, max |IMU stamp - VESC stamp| (VESC is 50 Hz)
+    standstill_erpm: 50.0    # |ERPM| below this is treated as v = 0
+
+    speed_stddev: 0.1        # m/s
+    yaw_rate_stddev: 0.02    # rad/s (ZED IMU at standstill: ~0.007-0.01)
