@@ -132,6 +132,22 @@ class ParticleFiler(Node):
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
         self.MOTION_DISPERSION_Y     = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
+        # motion_noise: 'fixed' (original: the dispersions above every update, in the
+        # map x/y axes, even when the car stands still) or 'proportional' (car frame,
+        # grows with the distance / rotation since the last update, small floor).
+        # Defaults from a replay sweep on the 2026-10-19 bag (scan_synchronous): still
+        # jitter p95 18 -> 8 cm, lateral step error vs ZED VO 6.8 -> 1.6 cm, same map
+        # fit and turn heading. Floors much lower drift off the map (fit 76 -> 55 %).
+        self.MOTION_NOISE = self.declare_parameter('motion_noise', 'fixed').value
+        if self.MOTION_NOISE not in ('fixed', 'proportional'):
+            raise ValueError("motion_noise must be 'fixed' or 'proportional'")
+        self.NOISE_ALONG_MIN = self.declare_parameter('noise_along_min', 0.02).value        # m
+        self.NOISE_ALONG_PER_M = self.declare_parameter('noise_along_per_m', 0.3).value    # m/m
+        self.NOISE_LAT_MIN = self.declare_parameter('noise_lat_min', 0.02).value            # m
+        self.NOISE_LAT_PER_M = self.declare_parameter('noise_lat_per_m', 0.1).value        # m/m
+        self.NOISE_THETA_MIN = self.declare_parameter('noise_theta_min', 0.01).value        # rad
+        self.NOISE_THETA_PER_RAD = self.declare_parameter('noise_theta_per_rad', 0.1).value  # rad/rad
+        self.NOISE_THETA_PER_M = self.declare_parameter('noise_theta_per_m', 0.05).value    # rad/m
         
         # various data containers used in the MCL algorithm
         self.MAX_RANGE_PX = None
@@ -580,7 +596,7 @@ class ParticleFiler(Node):
         function call overhead
         
         TODO this could be better, but it works for now
-            - fixed random noise is not very realistic
+            - fixed random noise is not very realistic (see motion_noise: proportional)
             - ackermann model provides bad estimates at high speed
         '''
         # rotate the action into the coordinate space of each particle
@@ -593,6 +609,16 @@ class ParticleFiler(Node):
         self.local_deltas[:,2] = action[2]
 
         proposal_dist[:,:] += self.local_deltas
+        if self.MOTION_NOISE == 'proportional':
+            dist = np.hypot(action[0], action[1])
+            n_along = np.random.normal(0.0, self.NOISE_ALONG_MIN + self.NOISE_ALONG_PER_M * dist, self.MAX_PARTICLES)
+            n_lat = np.random.normal(0.0, self.NOISE_LAT_MIN + self.NOISE_LAT_PER_M * dist, self.MAX_PARTICLES)
+            proposal_dist[:,0] += cosines*n_along - sines*n_lat
+            proposal_dist[:,1] += sines*n_along + cosines*n_lat
+            proposal_dist[:,2] += np.random.normal(
+                0.0, self.NOISE_THETA_MIN + self.NOISE_THETA_PER_RAD * abs(action[2]) + self.NOISE_THETA_PER_M * dist,
+                self.MAX_PARTICLES)
+            return
         proposal_dist[:,0] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_X,size=self.MAX_PARTICLES)
         proposal_dist[:,1] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_Y,size=self.MAX_PARTICLES)
         proposal_dist[:,2] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_THETA,size=self.MAX_PARTICLES)

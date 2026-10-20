@@ -51,6 +51,9 @@ ros2 launch particle_filter localize_launch.py                  # original: upda
 ros2 launch particle_filter localize_launch.py scan_sync:=true  # one update per scan, motion up to the scan's measurement time, pose stamped with it
 ros2 launch particle_filter localize_launch.py ekf:=true        # pose source of rc_localization (scan_sync + twist motion model, no TF)
 ```
+`motion_noise:=proportional` (any mode) adds the motion noise in the car frame, proportional to the motion
+since the last update, instead of the fixed `motion_dispersion_*` every update (less jitter, see the commit).
+
 With `scan_sync:=true` the consumers must use the stamp: `ekf_localization.launch.py pose_stamp_offset:=0.0`,
 `mpc.launch.py localization:=pf pf_scan_sync:=true`.
 

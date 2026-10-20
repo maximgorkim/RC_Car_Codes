@@ -56,14 +56,19 @@ def generate_launch_description():
                                          description='true: pose per scan, stamped with the scan time')
     scan_sync = PythonExpression(["'", LaunchConfiguration('ekf'), "' == 'true' or '",
                                   LaunchConfiguration('scan_sync'), "' == 'true'"])
-    ld = LaunchDescription([localize_la, ekf_la, scan_sync_la])
+    # motion_noise:=proportional -> motion noise in the car frame, proportional to
+    # the motion since the last update (default 'fixed': the config dispersions)
+    motion_noise_la = DeclareLaunchArgument('motion_noise', default_value='fixed',
+                                            description='fixed | proportional')
+    ld = LaunchDescription([localize_la, ekf_la, scan_sync_la, motion_noise_la])
 
     # nodes
     pf_node = Node(
         package='particle_filter',
         executable='particle_filter',
         name='particle_filter',
-        parameters=[config, {'scan_synchronous': scan_sync}]
+        parameters=[config, {'scan_synchronous': scan_sync,
+                             'motion_noise': LaunchConfiguration('motion_noise')}]
     )
     map_server_node = Node(
         package='nav2_map_server',
