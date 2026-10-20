@@ -49,14 +49,21 @@ def generate_launch_description():
     ekf_config = os.path.join(get_package_share_directory('particle_filter'), 'config', 'localize_ekf.yaml')
     config = PythonExpression(["'", ekf_config, "' if '", LaunchConfiguration('ekf'), "' == 'true' else '",
                                LaunchConfiguration('localize_config'), "'"])
-    ld = LaunchDescription([localize_la, ekf_la])
+    # scan_sync:=true -> one update per scan, motion up to the scan's measurement
+    # time and the pose stamped with it (always on with ekf:=true). Consumers must
+    # then use the stamp: EKF pose_stamp_offset:=0.0, MPC pf_scan_sync:=true
+    scan_sync_la = DeclareLaunchArgument('scan_sync', default_value='false',
+                                         description='true: pose per scan, stamped with the scan time')
+    scan_sync = PythonExpression(["'", LaunchConfiguration('ekf'), "' == 'true' or '",
+                                  LaunchConfiguration('scan_sync'), "' == 'true'"])
+    ld = LaunchDescription([localize_la, ekf_la, scan_sync_la])
 
     # nodes
     pf_node = Node(
         package='particle_filter',
         executable='particle_filter',
         name='particle_filter',
-        parameters=[config]
+        parameters=[config, {'scan_synchronous': scan_sync}]
     )
     map_server_node = Node(
         package='nav2_map_server',

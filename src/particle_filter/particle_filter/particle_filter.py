@@ -23,8 +23,10 @@
 # ros2 python
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 # libraries
+import collections
 import numpy as np
 import range_libc
 import time
@@ -112,6 +114,10 @@ class ParticleFiler(Node):
         self.SCAN_SYNC     = self.declare_parameter('scan_synchronous', False).value
         self.MOTION_SOURCE = self.declare_parameter('motion_source', 'odom').value
         self.TWIST_TOPIC   = self.declare_parameter('twist_topic', '/localization/twist_with_cov').value
+        # scan_synchronous: the pose refers to the scan's measurement time,
+        # header stamp + scan_meas_fraction * scan duration. The YDLidar stamps the
+        # first point and publishes after the last one, so 0.5 = middle of the scan.
+        self.SCAN_MEAS_FRACTION = self.declare_parameter('scan_meas_fraction', 0.5).value
         if self.MOTION_SOURCE not in ('odom', 'twist'):
             raise ValueError("motion_source must be 'odom' or 'twist'")
 
@@ -148,6 +154,12 @@ class ParticleFiler(Node):
         self.scan_stamp = None
         self.last_twist_t = None
         self.twist_theta = 0.0   # heading change since the last MCL update (twist motion source)
+        # scan_synchronous: dead-reckoned (t, x, y, theta) of the motion source, so
+        # the motion applied in an update ends exactly at the scan's measurement time
+        self.motion_hist = collections.deque()
+        self.twist_pose = np.zeros(3)   # twist source: integrated pose
+        self.meas_t = None              # measurement time of the current scan [s]
+        self.last_meas_t = None         # measurement time of the previous update [s]
 
         # cache this to avoid memory allocation in motion model
         self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
@@ -390,6 +402,9 @@ class ParticleFiler(Node):
         self.scan_stamp = msg.header.stamp
         self.lidar_initialized = True
         if self.SCAN_SYNC:
+            duration = msg.scan_time if msg.scan_time > 0.0 else msg.time_increment * len(msg.ranges)
+            self.meas_t = (msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+                           + self.SCAN_MEAS_FRACTION * duration)
             self.update()
 
     def odomCB(self, msg):
@@ -405,6 +420,9 @@ class ParticleFiler(Node):
         orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
         pose = np.array([position[0], position[1], orientation])
         self.current_speed = msg.twist.twist.linear.x
+        if self.SCAN_SYNC:
+            self.motion_hist.append((msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec,
+                                     pose[0], pose[1], pose[2]))
 
         if isinstance(self.last_pose, np.ndarray):
             rot = Utils.rotation_matrix(-self.last_pose[2])
@@ -442,9 +460,13 @@ class ParticleFiler(Node):
             self.odometry_data[1] += v * np.sin(th) * dt
             self.odometry_data[2] += w * dt
             self.twist_theta += w * dt
+            th = self.twist_pose[2] + 0.5 * w * dt
+            self.twist_pose += (v * np.cos(th) * dt, v * np.sin(th) * dt, w * dt)
             self.odom_initialized = True
         else:
             self.get_logger().info('...Received first twist message')
+        if self.SCAN_SYNC:
+            self.motion_hist.append((t, *self.twist_pose))
         self.last_twist_t = t
         self.last_stamp = msg.header.stamp
         if not self.SCAN_SYNC:
@@ -541,9 +563,12 @@ class ParticleFiler(Node):
             # normalize
             self.sensor_model_table[:,int(d)] /= norm
 
-        # upload the sensor model to RangeLib for ultra fast resolution
+        # upload the sensor model to RangeLib for ultra fast resolution.
+        # The squash exponent is applied per beam here instead of to the product
+        # afterwards: prod(p^(1/s)) == prod(p)^(1/s), but the raw product of
+        # ~100 beams underflows double precision (all weights 0 -> NaN).
         if self.RANGELIB_VAR > 0:
-            self.range_method.set_sensor_model(self.sensor_model_table)
+            self.range_method.set_sensor_model(np.power(self.sensor_model_table, self.INV_SQUASH_FACTOR))
 
     def motion_model(self, proposal_dist, action):
         '''
@@ -606,14 +631,12 @@ class ParticleFiler(Node):
 
                 # evaluate the sensor model
                 self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
-                # apply the squash factor
-                self.weights = np.power(self.weights, self.INV_SQUASH_FACTOR)
+                # (squash factor: already in the RangeLib sensor table)
             else:
                 self.get_logger().info('Cannot use radial optimizations with non-CDDT based methods, use rangelib_variant 2')
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT:
             self.queries[:,:] = proposal_dist[:,:]
             self.range_method.calc_range_repeat_angles_eval_sensor_model(self.queries, self.downsampled_angles, obs, self.weights)
-            np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR:
             if self.SHOW_FINE_TIMING:
                 t_start = time.time()
@@ -628,7 +651,7 @@ class ParticleFiler(Node):
             self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
             if self.SHOW_FINE_TIMING:
                 t_eval = time.time()
-            np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
+            # (squash factor: already in the RangeLib sensor table)
             if self.SHOW_FINE_TIMING:
                 t_squash = time.time()
                 t_total = (t_squash - t_start) / 100.0
@@ -648,7 +671,6 @@ class ParticleFiler(Node):
 
             # evaluate the sensor model on the GPU
             self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
-            np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_NO_EVAL_SENSOR_MODEL:
             # this version directly uses the sensor model in Python, at a significant computational cost
             self.queries[:,0] = np.repeat(proposal_dist[:,0], num_rays)
@@ -704,8 +726,16 @@ class ParticleFiler(Node):
         if self.SHOW_FINE_TIMING:
             t_sensor = time.time()
 
-        # normalize importance weights
-        self.weights /= np.sum(self.weights)
+        # normalize importance weights; if every particle got weight 0 (scan
+        # matches nowhere near the particles) keep them all instead of crashing
+        # in np.random.choice on NaN
+        total = np.sum(self.weights)
+        if np.isfinite(total) and total > 0.0:
+            self.weights /= total
+        else:
+            self.weights[:] = 1.0 / self.MAX_PARTICLES
+            self.get_logger().warn('all particle weights are zero: scan does not match the map near the particles',
+                                   throttle_duration_sec=1.0)
         if self.SHOW_FINE_TIMING:
             t_norm = time.time()
             t_total = (t_norm - t)/100.0
@@ -720,6 +750,41 @@ class ParticleFiler(Node):
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
         return np.dot(self.particles.transpose(), self.weights)
+
+    def motion_pose_at(self, t):
+        '''
+        Dead-reckoned pose of the motion source at time t, interpolated in
+        motion_hist (clamped to the oldest / newest sample).
+        '''
+        h = self.motion_hist
+        if t <= h[0][0]:
+            return np.array(h[0][1:])
+        if t >= h[-1][0]:
+            return np.array(h[-1][1:])
+        i = len(h) - 1
+        while h[i - 1][0] > t:
+            i -= 1
+        (ta, xa, ya, tha), (tb, xb, yb, thb) = h[i - 1], h[i]
+        f = (t - ta) / (tb - ta) if tb > ta else 1.0
+        dth = (thb - tha + np.pi) % (2.0 * np.pi) - np.pi
+        return np.array([xa + f * (xb - xa), ya + f * (yb - ya), tha + f * dth])
+
+    def scan_sync_action(self):
+        '''
+        Motion between the previous and the current scan measurement time, in
+        the car frame at the previous one ([dx, dy, dtheta], like odometry_data).
+        '''
+        if not self.motion_hist:
+            return np.zeros(3)
+        b = self.motion_pose_at(self.meas_t)
+        a = self.motion_pose_at(self.last_meas_t) if self.last_meas_t is not None else b
+        self.last_meas_t = self.meas_t
+        # keep one sample at or before this measurement for the next interpolation
+        while len(self.motion_hist) > 1 and self.motion_hist[1][0] <= self.meas_t:
+            self.motion_hist.popleft()
+        c, s = np.cos(a[2]), np.sin(a[2])
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        return np.array([c * dx + s * dy, -s * dx + c * dy, (b[2] - a[2] + np.pi) % (2.0 * np.pi) - np.pi])
 
     def update(self):
         '''
@@ -745,7 +810,7 @@ class ParticleFiler(Node):
 
                 t1 = time.time()
                 observation = np.copy(self.downsampled_ranges).astype(np.float32)
-                action = np.copy(self.odometry_data)
+                action = self.scan_sync_action() if self.SCAN_SYNC else np.copy(self.odometry_data)
                 self.odometry_data = np.zeros(3)
                 self.twist_theta = 0.0
 
@@ -758,7 +823,9 @@ class ParticleFiler(Node):
                 t2 = time.time()
 
                 # publish transformation frame based on inferred pose
-                self.publish_tf(self.inferred_pose, self.scan_stamp if self.SCAN_SYNC else self.last_stamp)
+                self.publish_tf(self.inferred_pose,
+                                Time(nanoseconds=int(self.meas_t * 1e9)).to_msg() if self.SCAN_SYNC
+                                else self.last_stamp)
 
                 # this is for tracking particle filter speed
                 ips = 1.0 / (t2 - t1)
