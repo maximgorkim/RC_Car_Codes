@@ -288,7 +288,8 @@ void TrackingController::on_command_sent(double t, double v_cmd, double d_cmd) {
   last_d_cmd_ = d_cmd;
 }
 
-ControlOutput TrackingController::on_pose(double t_arr, double px, double py, double yaw, double v_ref) {
+ControlOutput TrackingController::on_pose(double t_arr, double px, double py, double yaw, double v_ref,
+                                          double pose_age) {
   ControlOutput o;
   if (!path_) return o;
   if (vel_.empty()) {
@@ -309,7 +310,8 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   }
   // ---- latency compensation
   const double L = p_.model.wheelbase, a = p_.model.lever_arm;
-  const double t_pos = t_arr - p_.pose_latency_position, t_hdg = t_arr - p_.pose_latency_heading;
+  const double t_pos = t_arr - pose_age - p_.pose_latency_position;
+  const double t_hdg = t_arr - pose_age - p_.pose_latency_heading;
   const double t_start = t_arr + std::max(p_.compute_delay, compute_ema_) + p_.steer_dead_time;
   const double h = 0.005;
   const bool imu_ok = p_.use_imu && !imu_.empty() && imu_.back().first > t_arr - 0.2;

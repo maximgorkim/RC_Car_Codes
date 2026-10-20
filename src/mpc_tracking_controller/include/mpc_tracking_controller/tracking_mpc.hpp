@@ -146,7 +146,9 @@ class TrackingController {
   const PathGeometry* path() const { return path_.get(); }
   void on_imu(double t, double yaw_rate);
   void on_speed(double t, double v);
-  ControlOutput on_pose(double t_arrival, double x, double y, double yaw, double v_ref);
+  // pose_age: arrival - pose stamp when the stamp is the measurement time
+  // (pose_latency_* then only hold the residual); 0 with now()-stamped poses
+  ControlOutput on_pose(double t_arrival, double x, double y, double yaw, double v_ref, double pose_age = 0.0);
   // every command actually published (stop commands too); delta in servo-command radians
   void on_command_sent(double t, double v_cmd, double delta_cmd);
   void reset_mpc() { mpc_.reset(); }

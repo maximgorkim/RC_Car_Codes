@@ -13,6 +13,7 @@
 //        /mpc/state        std_msgs/Float64MultiArray  [pose stamp, e_lat, e_psi, x0 (4), s0, v_ref,
 //                                                   v_cmd, delta_cmd, solve ms, QP iterations, converged]
 // One control step per pose message (decimated to control_period).
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -55,6 +56,9 @@ class MpcNode : public rclcpp::Node {
     servo_min_ = D("servo_min", 0.2);
     servo_max_ = D("servo_max", 0.8);
     require_arming_ = this->declare_parameter<bool>("require_arming", true);
+    // true: the pose stamp is its measurement time (particle filter scan_synchronous),
+    // latency = arrival - stamp + model.pose_latency_* (residual); false: fixed model.pose_latency_*
+    pose_latency_from_stamp_ = this->declare_parameter<bool>("pose_latency_from_stamp", false);
     joy_button_ = this->declare_parameter<int>("joy_button", 0);
     joy_cooldown_ = D("joy_cooldown", 0.5);
     odom_timeout_ = D("odom_timeout", 0.5);
@@ -224,7 +228,9 @@ class MpcNode : public rclcpp::Node {
     const auto& q = msg->pose.pose.orientation;
     const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     const double v_ref = std::max(v_ref_, 0.0);  // the MPC bounds it by v_max and the lateral-acceleration cap
-    const ControlOutput o = ctrl_->on_pose(t_arr, msg->pose.pose.position.x, msg->pose.pose.position.y, yaw, v_ref);
+    const double pose_age = pose_latency_from_stamp_ ? std::clamp(t_arr - stamp, 0.0, 0.5) : 0.0;
+    const ControlOutput o =
+        ctrl_->on_pose(t_arr, msg->pose.pose.position.x, msg->pose.pose.position.y, yaw, v_ref, pose_age);
     if (o.status != Status::kOk) {
       publish_stop();
       if (o.status == Status::kAbort) {
@@ -277,7 +283,7 @@ class MpcNode : public rclcpp::Node {
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr sub_vesc_;
   rclcpp::TimerBase::SharedPtr watchdog_, report_;
   double speed_cmd_per_mps_, servo_per_rad_, servo_center_, servo_min_, servo_max_;
-  bool require_arming_ = true, armed_ = false;
+  bool require_arming_ = true, armed_ = false, pose_latency_from_stamp_ = false;
   int joy_button_ = 0;
   double joy_cooldown_ = 0.5, odom_timeout_ = 0.5, speed_timeout_ = 1.0, control_period_ = 0.1;
   double v_ref_ = 0.0;

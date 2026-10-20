@@ -32,6 +32,13 @@ def setup(context):
                      "model.pose_latency_heading": 0.0})
     elif localization != "pf":
         raise RuntimeError(f"localization:={localization}: expected 'pf' or 'ekf'")
+    elif LaunchConfiguration("pf_scan_sync").perform(context) == "true":
+        # PF started with scan_sync:=true: its stamp is the scan time, so the
+        # latency is taken from the stamp; the config values become the residual
+        # (PF heading lags its stamp by ~25 ms on the 2026-10-19 bag, replayed)
+        over.update({"pose_latency_from_stamp": True,
+                     "model.pose_latency_position": 0.025,
+                     "model.pose_latency_heading": 0.025})
     for name in ("v_max", "a_lat_max"):  # optional overrides of the config's speed limits
         value = LaunchConfiguration(name).perform(context)
         if value:
@@ -56,6 +63,8 @@ def generate_launch_description():
         DeclareLaunchArgument("config", default_value=os.path.join(share, "config", "mpc_car.yaml")),
         DeclareLaunchArgument("path_topic", default_value="", description="override, e.g. /selected_path"),
         DeclareLaunchArgument("localization", default_value="pf", description="pf | ekf (see above)"),
+        DeclareLaunchArgument("pf_scan_sync", default_value="false",
+                              description="true with particle_filter scan_sync:=true (latency from the pose stamp)"),
         DeclareLaunchArgument("v_max", default_value="", description="m/s, override the config's speed limit"),
         DeclareLaunchArgument("a_lat_max", default_value="",
                               description="m/s^2, override the curve speed cap sqrt(a_lat_max/|kappa|)"),
