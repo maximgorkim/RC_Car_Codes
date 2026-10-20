@@ -44,6 +44,19 @@ The "range_method" parameter determines which RangeLibc ray casting method to us
 
 ![Range Method Performance Comparison](./media/comparison.png)
 
+# This fork: launch modes and offline replay
+
+```
+ros2 launch particle_filter localize_launch.py                  # original: updates driven by the odometry (10 Hz throttle), stamped now()
+ros2 launch particle_filter localize_launch.py scan_sync:=true  # one update per scan, motion up to the scan's measurement time, pose stamped with it
+ros2 launch particle_filter localize_launch.py ekf:=true        # pose source of rc_localization (scan_sync + twist motion model, no TF)
+```
+With `scan_sync:=true` the consumers must use the stamp: `ekf_localization.launch.py pose_stamp_offset:=0.0`,
+`mpc.launch.py localization:=pf pf_scan_sync:=true`.
+
+[tools/](tools/README.md) runs this node over a recorded rosbag on a PC (CPU range_libc) to compare
+parameters / code changes without the car: timing, scan reuse, pose lag and consistency metrics.
+
 # Docs
 
 This code is the staff solution to the lab guide found in the [/docs](/particle_filter/docs) folder. A mathematical derivation of MCL is available in that guide.
