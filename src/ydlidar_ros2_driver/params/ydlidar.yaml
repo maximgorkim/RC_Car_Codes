@@ -6,7 +6,7 @@ ydlidar_ros2_driver_node:
     baudrate: 230400
     lidar_type: 1
     device_type: 0
-    isSingleChannel: true
+    isSingleChannel: false   # true: SDK skips checkScanFrequency -> lidar stuck at ~7 Hz
     intensity: true
     intensity_bit: 0
     sample_rate: 9
@@ -15,7 +15,7 @@ ydlidar_ros2_driver_node:
     reversion: true
     inverted: true
     auto_reconnect: true
-    support_motor_dtr: true
+    support_motor_dtr: false
     angle_max: 180.0
     angle_min: -180.0
     range_max: 64.0
