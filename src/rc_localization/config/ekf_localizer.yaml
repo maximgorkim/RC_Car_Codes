@@ -1,4 +1,6 @@
-ekf_localizer:
+# '/**' rather than the node name: on Foxy a node-name key wins over the launch
+# file's overrides (publish_tf:=false, v_max:=..., ...), which are given as '/**'.
+/**:
   ros__parameters:
     # ---------------- topics / frames
     twist_topic: /localization/twist_with_cov

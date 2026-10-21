@@ -4,7 +4,9 @@
 # the same values RC_Car_Sim/src/plugins_pkgs/car_plugin/config/car_like.json uses.
 # Weights and constraints are those of the IRL controller (config/controller.yaml, CostConfig),
 # so both are compared on the same objective. Design choices are marked as such.
-mpc_controller:
+# '/**' rather than the node name: on Foxy a node-name key wins over the launch
+# file's overrides (publish_tf:=false, v_max:=..., ...), which are given as '/**'.
+/**:
   ros__parameters:
     odom_topic: /pf/pose/odom
     path_topic: /selected_path
