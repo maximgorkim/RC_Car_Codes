@@ -49,6 +49,26 @@
       max: 0.03                # rad
       min_speed: 0.5           # m/s
       max_delta: 0.06          # rad, only near straight driving
+    # Slippery floor (wet / dusty): slide detection from the IMU yaw rate vs the model, grip estimate,
+    # and the MPC's limits from it (lateral-acceleration cap, braking-distance cap over the horizon,
+    # friction circle for the rear-driven car). Off by default. tools/stack_sim, dynamic tyre plant,
+    # 3 m/s, 16 seeds: uniform mu 0.5 crashes 16/16 -> 1/16, a wet stretch (mu 0.35) 16/16 -> 0/16,
+    # dry lateral error 11 -> 7 cm but laps ~20 % slower; the identified (kinematic) car: no change.
+    grip:
+      adaptation: false
+      nominal: 1.0             # g, the floor a_lat_max / v_rate_max were made for (assumed)
+      min: 0.15                # g
+      margin: 0.8              # use this fraction of the estimate
+      recover_tau: 30.0        # s back towards nominal without slides
+      drive_axle_load: 0.5     # rear (driven) axle share of the weight
+      slip_rel: 0.15           # slide: |r_model - r_imu| > slip_rel |r_model| + slip_abs
+      slip_abs: 0.08           # rad/s (model RMSE on the bags 0.06-0.07)
+      slip_min_speed: 0.8      # m/s
+    # Online understeer (model.understeer, yaw rate = v tan(d) / (L (1 + k v^2))) from the IMU while
+    # gripping; 0 = off. stack_sim dynamic plant at 3 m/s: 11.0 -> 9.5 cm, same lap time.
+    understeer:
+      tau: 0.0                 # s
+      max: 0.3                 # s^2/m^2
 
     model:
       wheelbase: 0.28          # m, in pose units (servo_per_rad calibrated for L = 0.28)
@@ -61,6 +81,7 @@
       speed_dead_time: 0.18    # s   car_model.json speed (VESC; val. RMSE 0.050-0.077 m/s)
       speed_tau: 0.25          # s
       speed_gain: 1.005
+      understeer: 0.0          # s^2/m^2, 0 = kinematic (identified at the bags' speeds)
       pose_latency_position: 0.239   # s  PF position vs IMU/VESC dead reckoning (fair_irl_1, +-0.011)
       pose_latency_heading: 0.200    # s  PF heading vs IMU (fair_irl_1; 0.170 with pure pursuit)
       heading_bias: 0.045            # rad course - PF heading on straights (all four directions)

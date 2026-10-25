@@ -162,3 +162,41 @@ TEST(TrackingController, SteeringOffsetEstimate) {
     }
   }
 }
+
+// Constant-radius turn: the IMU yaw rate follows a car with understeer k (no slide). At a moderate
+// lateral acceleration the online estimate learns k and no slide is reported; then, at a higher speed,
+// the car plows (yaw rate at 40 % of the model): a slide is reported and the grip estimate drops to
+// the lateral acceleration the car reached.
+TEST(TrackingController, UnderSteerAndGripEstimate) {
+  std::vector<double> x, y;
+  circle(3.0, 600, x, y);
+  ControllerParams p;
+  p.understeer_tau = 1.0;
+  p.grip_adaptation = true;
+  TrackingController c(p);
+  c.set_path(x, y);
+  const double L = p.model.wheelbase, k_true = 0.05;
+  double t = 0.0, a = 0.0;
+  auto yaw_rate = [&](double v, double d_cmd) {
+    return v * std::tan(c.steer_to_eff(d_cmd)) / (L * (1.0 + k_true * v * v));
+  };
+  auto drive = [&](double v, double d_cmd, double r_factor, int steps) {
+    for (int k = 0; k < steps; ++k) {
+      for (int i = 0; i < 20; ++i) {
+        t += 0.005;
+        c.on_imu(t, r_factor * yaw_rate(v, d_cmd));
+        c.on_speed(t, v);
+      }
+      a += 0.01;
+      c.on_pose(t, 3.0 * std::cos(a), 3.0 * std::sin(a), a + M_PI / 2, v);
+      c.on_command_sent(t, v, d_cmd);  // hold the command: only the estimators are tested
+    }
+  };
+  drive(2.0, 0.12, 1.0, 150);  // ~0.17 g
+  EXPECT_NEAR(c.understeer(), k_true, 0.01);
+  EXPECT_FALSE(c.slipping());
+  EXPECT_NEAR(c.grip(), p.grip_nominal, 1e-6);
+  drive(3.0, 0.25, 0.4, 10);  // asked ~0.57 g, reaches ~0.23 g
+  EXPECT_TRUE(c.slipping());
+  EXPECT_NEAR(c.grip(), 0.4 * 3.0 * yaw_rate(3.0, 0.25) / 9.81, 0.02);
+}

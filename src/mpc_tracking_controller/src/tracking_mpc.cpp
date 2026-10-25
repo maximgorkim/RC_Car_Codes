@@ -43,7 +43,7 @@ Eigen::Vector4d TrackingMpc::step(const Eigen::Vector4d& x, double v_cmd, double
     // actuators exactly (piecewise-constant input), kinematics by the midpoint rule
     const double v1 = vt + (s[2] - vt) * av, d1 = d_cmd + (s[3] - d_cmd) * ad;
     const double vm = 0.5 * (s[2] + v1), dm = 0.5 * (s[3] + d1);
-    const double r = vm * std::tan(dm) / L;
+    const double r = vm * std::tan(dm) / (L * (1.0 + mod_.understeer * vm * vm));
     auto f = [&](double ey, double ep, double& dey, double& dep, double& dsd) {
       const double den = std::max(1.0 - kappa * ey, 0.1);
       dsd = (vm * std::cos(ep) - a * r * std::sin(ep)) / den;
@@ -81,11 +81,27 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
   const int nd = set_.speed_delay_steps;
   const double dt = set_.dt;
   // lateral-acceleration cap per stage, on the curvature where the command acts
+  // With the friction circle on, the cap also respects the braking distance over the whole horizon
+  // (backward pass on the nominal arc lengths): the rear-axle motor brake gives only
+  // drive_axle_load * grip, so on a slippery floor the 0.6 s preview is far too short.
+  std::vector<double> brake_cap;
   auto cap_at = [&](int k) {
     double kmax = 1e-6;
     for (int j = k + nd; j <= std::min(N_, k + nd + set_.cap_preview_stages); ++j)
       kmax = std::max(kmax, std::fabs(kn_[std::min(j, N_)]));
-    return std::sqrt(set_.a_lat_max / kmax);
+    const double c = std::sqrt(set_.a_lat_max / kmax);
+    return brake_cap.empty() ? c : std::min(c, brake_cap[std::min(k + nd, N_)]);
+  };
+  auto update_brake_cap = [&]() {
+    if (set_.grip_accel <= 0.0) return;
+    brake_cap.assign(N_ + 1, 0.0);
+    const double a_b = set_.drive_axle_load * set_.grip_accel;
+    brake_cap[N_] = std::sqrt(set_.a_lat_max / std::max(std::fabs(kn_[N_]), 1e-6));
+    for (int k = N_ - 1; k >= 0; --k) {
+      const double ds = std::max(sn_[k + 1] - sn_[k], 0.0);
+      brake_cap[k] = std::min(std::sqrt(set_.a_lat_max / std::max(std::fabs(kn_[k]), 1e-6)),
+                              std::sqrt(brake_cap[k + 1] * brake_cap[k + 1] + 2.0 * a_b * ds));
+    }
   };
   if (!have_nominal_) {
     // cold start: the reference speed and the kinematic feed-forward steering along the path
@@ -106,6 +122,7 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
   MpcResult out;
   for (int it = 0; it < std::max(1, set_.sqp_iterations); ++it) {
     rollout(x0, s0, path, v_prev);
+    update_brake_cap();
     // --- condensed sensitivities S_k = d x_k / d z (finite differences of the stage map)
     for (auto& S : S_) S.setZero();
     for (int k = 0; k < N_; ++k) {
@@ -162,7 +179,18 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
       u_[2 * k] = std::max(set_.v_min, std::min(set_.v_max, cap_at(k)));
       l_[2 * k + 1] = set_.delta_lo;
       u_[2 * k + 1] = set_.delta_hi;
-      const double rv = set_.v_rate_max * dt, rd = set_.delta_rate_max * dt;
+      double rv = set_.v_rate_max * dt;
+      const double rd = set_.delta_rate_max * dt;
+      if (set_.grip_accel > 0.0) {
+        // friction circle where this speed change acts (after the speed channel's extra delay)
+        const Eigen::Vector4d& xa = xn_[std::min(k + nd, N_)];
+        const double a_lat =
+            xa[2] * xa[2] * std::fabs(std::tan(xa[3])) / (mod_.wheelbase * (1.0 + mod_.understeer * xa[2] * xa[2]));
+        const double g2 = set_.grip_accel * set_.grip_accel;
+        // never below 20 % of the grip: the car must still be able to slow down
+        const double a_lon = set_.drive_axle_load * std::sqrt(std::max(g2 - a_lat * a_lat, 0.04 * g2));
+        rv = std::min(rv, a_lon * dt);
+      }
       l_[n_ + 2 * k] = (k == 0 ? v_prev : 0.0) - rv;
       u_[n_ + 2 * k] = (k == 0 ? v_prev : 0.0) + rv;
       l_[n_ + 2 * k + 1] = (k == 0 ? d_prev : 0.0) - rd;
@@ -219,7 +247,8 @@ void LaggedActuator::advance(double t) {
 }
 
 // ================================================================ controller
-TrackingController::TrackingController(const ControllerParams& p) : p_(p), mpc_(p.model, p.mpc) {
+TrackingController::TrackingController(const ControllerParams& p)
+    : p_(p), mpc_(p.model, p.mpc), grip_(p.grip_nominal), understeer_(p.model.understeer) {
   steer_.configure(p_.steer_dead_time, p_.model.steer_tau, 1.0);
   speed_.configure(p_.speed_dead_time, p_.model.speed_tau, p_.model.speed_gain);
 }
@@ -288,11 +317,8 @@ void TrackingController::on_command_sent(double t, double v_cmd, double d_cmd) {
   last_d_cmd_ = d_cmd;
 }
 
-void TrackingController::update_steer_offset(double t_arr) {
-  if (p_.steer_offset_tau <= 0.0 || imu_.empty() || vel_.empty()) return;
-  // the last 0.1 s, 50 ms back so that the IMU and VESC samples around it have arrived
-  const double t1 = t_arr - 0.05, t0 = t1 - 0.1;
-  if (imu_.back().first < t1 || imu_.front().first > t0) return;
+bool TrackingController::imu_mean(double t0, double t1, double& r) const {
+  if (imu_.empty() || imu_.back().first < t1 || imu_.front().first > t0) return false;
   double r_sum = 0.0;
   int n = 0;
   for (const auto& s : imu_)
@@ -300,14 +326,74 @@ void TrackingController::update_steer_offset(double t_arr) {
       r_sum += s.second;
       ++n;
     }
-  if (n < 5) return;
+  if (n < 5) return false;
+  r = r_sum / n;
+  return true;
+}
+
+double TrackingController::yaw_rate_of(double v, double delta) const {
+  return v * std::tan(delta) / (p_.model.wheelbase * (1.0 + understeer_ * v * v));
+}
+
+void TrackingController::update_grip(double t_arr) {
+  if ((!p_.grip_adaptation && p_.understeer_tau <= 0.0) || vel_.empty()) return;
+  const double dt = last_grip_t_ < 0.0 ? 0.0 : std::min(t_arr - last_grip_t_, 0.5);
+  last_grip_t_ = t_arr;
+  const double t1 = t_arr - 0.05, t0 = t1 - 0.1, tm = 0.5 * (t0 + t1);
+  double r = 0.0;
+  if (!imu_mean(t0, t1, r)) return;
+  const double v = sample(vel_, tm);
+  const double delta = steer_to_eff(steer_.value_at(tm)) + steer_offset_;
+  const double r_model = yaw_rate_of(v, delta);
+  const double tol = p_.slip_rel * std::fabs(r_model) + p_.slip_abs;
+  // the car turns less than the model (front saturated: plows) while asked for a real turn, or
+  // more (rear saturated: spins)
+  const double sgn = r_model >= 0.0 ? 1.0 : -1.0;
+  const bool plow = std::fabs(v * r_model) > 0.1 * 9.81 && sgn * (r_model - r) > tol;
+  const bool spin = std::fabs(r) > 0.3 && sgn * (r - r_model) > tol;
+  const bool slip = v > p_.slip_min_speed && (plow || spin);
+
+  if (p_.grip_adaptation) {
+    if (slip) {
+      if (slip_count_ == 0) {
+        grip_before_ = grip_;
+        episode_max_ = 0.0;
+      }
+      // two windows in a row (0.2 s): one-off gyro / disturbance spikes are not a slide. The grip is
+      // the most the car reached during the slide (transients through the slide reach less).
+      episode_max_ = std::max(episode_max_, std::fabs(v * r) / 9.81);
+      if (++slip_count_ >= 2) grip_ = std::clamp(std::min(grip_before_, episode_max_), p_.grip_min, p_.grip_nominal);
+    } else {
+      slip_count_ = 0;
+      grip_ += (p_.grip_nominal - grip_) * (1.0 - std::exp(-dt / p_.grip_recover_tau));
+    }
+    const double g = p_.grip_margin * grip_ * 9.81;
+    mpc_.set_grip_limits(std::min(p_.mpc.a_lat_max, g), std::min(p_.mpc.v_rate_max, g * p_.mpc.drive_axle_load), g);
+  }
+  if (p_.understeer_tau > 0.0 && !slip && v > 1.2 && std::fabs(r) > 0.3 && std::fabs(std::tan(delta)) > 0.05 &&
+      r * delta > 0.0) {
+    // r = v tan(d) / (L (1 + k v^2))  ->  k = (v tan(d) / (L r) - 1) / v^2
+    const double k = (v * std::tan(delta) / (p_.model.wheelbase * r) - 1.0) / (v * v);
+    understeer_ += (std::clamp(k, 0.0, p_.understeer_max) - understeer_) * (1.0 - std::exp(-dt / p_.understeer_tau));
+    mpc_.set_understeer(understeer_);
+  }
+}
+
+void TrackingController::update_steer_offset(double t_arr) {
+  if (p_.steer_offset_tau <= 0.0 || imu_.empty() || vel_.empty()) return;
+  // the last 0.1 s, 50 ms back so that the IMU and VESC samples around it have arrived
+  const double t1 = t_arr - 0.05, t0 = t1 - 0.1;
+  double r_mean = 0.0;
+  if (!imu_mean(t0, t1, r_mean)) return;
+  // a sliding car says nothing about the servo trim
+  if (slip_count_ > 0) return;
   const double tm = 0.5 * (t0 + t1), v = sample(vel_, tm);
   const double d_model = steer_to_eff(steer_.value_at(tm));
   const double dt = last_offset_t_ < 0.0 ? 0.0 : std::min(t_arr - last_offset_t_, 0.5);
   last_offset_t_ = t_arr;
   if (v < p_.steer_offset_min_speed || std::fabs(d_model) > p_.steer_offset_max_delta) return;
   // the angle that explains the measured yaw rate, minus the one the model assumes
-  const double implied = std::atan(r_sum / n * p_.model.wheelbase / v) - d_model;
+  const double implied = std::atan(r_mean * p_.model.wheelbase / v) - d_model;
   steer_offset_ += (implied - steer_offset_) * (1.0 - std::exp(-dt / p_.steer_offset_tau));
   steer_offset_ = std::clamp(steer_offset_, -p_.steer_offset_max, p_.steer_offset_max);
 }
@@ -333,15 +419,16 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
     return o;
   }
   // ---- latency compensation
-  const double L = p_.model.wheelbase, a = p_.model.lever_arm;
+  const double a = p_.model.lever_arm;
   const double t_pos = t_arr - pose_age - p_.pose_latency_position;
   const double t_hdg = t_arr - pose_age - p_.pose_latency_heading;
   const double t_start = t_arr + std::max(p_.compute_delay, compute_ema_) + p_.steer_dead_time;
   const double h = 0.005;
   const bool imu_ok = p_.use_imu && !imu_.empty() && imu_.back().first > t_arr - 0.2;
+  update_grip(t_arr);
   update_steer_offset(t_arr);
   auto delta_at = [&](double t) { return steer_to_eff(steer_.value_at(t)) + steer_offset_; };
-  auto yaw_rate_model = [&](double t, double v) { return v * std::tan(delta_at(t)) / L; };
+  auto yaw_rate_model = [&](double t, double v) { return yaw_rate_of(v, delta_at(t)); };
   // heading at the position's time: back-integrate the IMU over [t_pos, t_hdg]
   double psi = yaw + p_.heading_bias;
   for (double t = t_hdg; t > t_pos + 1e-9; t -= h) {
@@ -365,7 +452,7 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   for (double t = t_arr; t < t_start - 1e-9; t += h) {
     const double hh = std::min(h, t_start - t), tm = t + 0.5 * hh;
     const double v = v_arr + speed_.value_at(tm) - vm_arr;
-    const double r = v * std::tan(delta_at(tm)) / L;
+    const double r = yaw_rate_of(v, delta_at(tm));
     const double pm = psi + 0.5 * hh * r;
     rx += hh * v * std::cos(pm);
     ry += hh * v * std::sin(pm);
@@ -385,7 +472,7 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
     return o;
   }
   // command limits exactly as the IRL node: box, rate per control period
-  const double rv = p_.mpc.v_rate_max * p_.control_period, rd = p_.mpc.delta_rate_max * p_.control_period;
+  const double rv = mpc_.settings().v_rate_max * p_.control_period, rd = p_.mpc.delta_rate_max * p_.control_period;
   o.v_cmd = std::min(std::max(o.mpc.v_cmd, std::max(p_.mpc.v_min, last_v_cmd_ - rv)), std::min(p_.mpc.v_max, last_v_cmd_ + rv));
   const double d = eff_to_steer(o.mpc.delta_eff - steer_offset_);
   o.delta_cmd = std::min(std::max(d, std::max(-p_.delta_cmd_max, last_d_cmd_ - rd)), std::min(p_.delta_cmd_max, last_d_cmd_ + rd));

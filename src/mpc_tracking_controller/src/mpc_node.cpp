@@ -12,7 +12,7 @@
 //        servo_topic       std_msgs/Float64         servo_center + delta * servo_per_rad (clamped)
 //        /mpc/state        std_msgs/Float64MultiArray  [pose stamp, e_lat, e_psi, x0 (4), s0, v_ref,
 //                                                   v_cmd, delta_cmd, solve ms, QP iterations, converged,
-//                                                   steering offset estimate]
+//                                                   steering offset, grip [g], slipping, understeer]
 // One control step per pose message (decimated to control_period).
 #include <algorithm>
 #include <chrono>
@@ -79,6 +79,18 @@ class MpcNode : public rclcpp::Node {
     p.pose_latency_position = D("model.pose_latency_position", p.pose_latency_position);
     p.pose_latency_heading = D("model.pose_latency_heading", p.pose_latency_heading);
     p.steer_offset_tau = D("steer_offset.tau", p.steer_offset_tau);
+    p.grip_adaptation = this->declare_parameter<bool>("grip.adaptation", p.grip_adaptation);
+    p.grip_nominal = D("grip.nominal", p.grip_nominal);
+    p.grip_min = D("grip.min", p.grip_min);
+    p.grip_margin = D("grip.margin", p.grip_margin);
+    p.grip_recover_tau = D("grip.recover_tau", p.grip_recover_tau);
+    p.mpc.drive_axle_load = D("grip.drive_axle_load", p.mpc.drive_axle_load);
+    p.slip_rel = D("grip.slip_rel", p.slip_rel);
+    p.slip_abs = D("grip.slip_abs", p.slip_abs);
+    p.slip_min_speed = D("grip.slip_min_speed", p.slip_min_speed);
+    p.model.understeer = D("model.understeer", p.model.understeer);
+    p.understeer_tau = D("understeer.tau", p.understeer_tau);
+    p.understeer_max = D("understeer.max", p.understeer_max);
     p.steer_offset_max = D("steer_offset.max", p.steer_offset_max);
     p.steer_offset_min_speed = D("steer_offset.min_speed", p.steer_offset_min_speed);
     p.steer_offset_max_delta = D("steer_offset.max_delta", p.steer_offset_max_delta);
@@ -257,7 +269,8 @@ class MpcNode : public rclcpp::Node {
     stat_nc_ += o.mpc.qp_converged ? 0 : 1;
     std_msgs::msg::Float64MultiArray st;
     st.data = {stamp, o.meas.e_lat, o.meas.e_psi, o.x0[0], o.x0[1], o.x0[2], o.x0[3], o.s0, v_ref,
-               o.v_cmd, o.delta_cmd, ms, static_cast<double>(o.mpc.qp_iterations), o.mpc.qp_converged ? 1.0 : 0.0, ctrl_->steer_offset()};
+               o.v_cmd, o.delta_cmd, ms, static_cast<double>(o.mpc.qp_iterations), o.mpc.qp_converged ? 1.0 : 0.0, ctrl_->steer_offset(),
+               ctrl_->grip(), ctrl_->slipping() ? 1.0 : 0.0, ctrl_->understeer()};
     pub_state_->publish(st);
   }
 

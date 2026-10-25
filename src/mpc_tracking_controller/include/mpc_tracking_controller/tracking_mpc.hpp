@@ -36,6 +36,8 @@ struct ModelParams {
   double steer_tau = 0.04;   // s
   double speed_tau = 0.25;   // s
   double speed_gain = 1.005;
+  // understeer: yaw rate = v tan(delta) / (L (1 + understeer v^2)) [s^2/m^2]; 0 = kinematic
+  double understeer = 0.0;
 };
 
 struct MpcSettings {
@@ -50,6 +52,12 @@ struct MpcSettings {
   double v_min = 0.0, v_max = 2.0, delta_lo = -0.314, delta_hi = 0.347;
   double v_rate_max = 2.0, delta_rate_max = 1.5, a_lat_max = 2.0;
   int cap_preview_stages = 6;  // lateral-acceleration cap over this many stages ahead (0.6 s, as IRL)
+  // Friction circle: total acceleration the tyres give [m/s^2], 0 = off (separate limits, as before).
+  // The speed change per stage is then also bounded by drive_axle_load * sqrt(grip^2 - a_lat^2),
+  // a_lat from the previous solution where that speed change acts: a rear-driven car accelerating
+  // out of a corner on a slippery floor otherwise spends the rear grip on traction and spins.
+  double grip_accel = 0.0;
+  double drive_axle_load = 0.5;
   int sqp_iterations = 1;      // 1 = real-time iteration
   QpSettings qp;
 };
@@ -74,6 +82,13 @@ class TrackingMpc {
   // one stage of the model; returns x_next, adds the travelled arc length to ds
   Eigen::Vector4d step(const Eigen::Vector4d& x, double v_cmd, double d_cmd, double kappa, double& ds) const;
   const MpcSettings& settings() const { return set_; }
+  // limits that change at run time (grip adaptation); the configured ones are the upper bounds
+  void set_understeer(double k) { mod_.understeer = k; }
+  void set_grip_limits(double a_lat_max, double v_rate_max, double grip_accel) {
+    set_.a_lat_max = a_lat_max;
+    set_.v_rate_max = v_rate_max;
+    set_.grip_accel = grip_accel;
+  }
 
  private:
   void rollout(const Eigen::Vector4d& x0, double s0, const PathGeometry& path, double v_prev);
@@ -132,6 +147,24 @@ struct ControllerParams {
   double steer_offset_max = 0.03;        // rad, |estimate| bound
   double steer_offset_min_speed = 0.5;   // m/s, below this the yaw rate says little about the angle
   double steer_offset_max_delta = 0.06;  // rad, only near straight driving (understeer, map errors)
+  // Grip adaptation (wet / slippery floor). The kinematic model holds while the tyres grip; when
+  // they saturate the measured yaw rate departs from v tan(delta) / L (the car plows or spins).
+  // Then the available grip is what the car achieved (v r), and the MPC's lateral-acceleration
+  // speed cap and acceleration limit shrink to grip_margin of it; without saturation the estimate
+  // recovers towards grip_nominal with grip_recover_tau. Off by default.
+  bool grip_adaptation = false;     // also turns the MPC's friction circle on
+  double grip_nominal = 1.0;      // g, the floor the configured limits were made for
+  double grip_min = 0.15;         // g
+  double grip_margin = 0.8;       // use this fraction of the estimate
+  double grip_recover_tau = 30.0;  // s (8 s: the car forgot a wet stretch before the next lap)
+  double slip_rel = 0.15;         // saturation: |r_model - r_imu| > slip_rel |r_model| + slip_abs
+  double slip_abs = 0.08;         // rad/s, above the model / IMU noise (validated RMSE 0.06-0.07)
+  double slip_min_speed = 0.8;    // m/s
+  // Online understeer estimate (model.understeer) from yaw rate vs steering while gripping, low-passed
+  // with this time constant [s]; 0 = off. Saturation is then judged against the learned model, so
+  // the tyres' normal (linear) understeer is not taken for a slide.
+  double understeer_tau = 0.0;
+  double understeer_max = 0.3;    // s^2/m^2
 };
 
 enum class Status { kOk, kNoPath, kNoSpeed, kAbort };
@@ -162,6 +195,9 @@ class TrackingController {
   double steer_to_eff(double d_cmd) const;
   double eff_to_steer(double d_eff) const;
   double steer_offset() const { return steer_offset_; }
+  double grip() const { return grip_; }  // g, current estimate (grip_nominal when off)
+  double understeer() const { return understeer_; }
+  bool slipping() const { return slip_count_ > 0; }
 
  private:
   double sample(const std::deque<std::pair<double, double>>& buf, double t) const;
@@ -175,6 +211,13 @@ class TrackingController {
   double pending_arrival_ = -1.0;
   double steer_offset_ = 0.0, last_offset_t_ = -1.0;
   void update_steer_offset(double t_arr);
+  // mean IMU yaw rate over [t0, t1]; false if too few samples
+  bool imu_mean(double t0, double t1, double& r) const;
+  double grip_ = 1.0, last_grip_t_ = -1.0, grip_before_ = 1.0, episode_max_ = 0.0;
+  double understeer_ = 0.0;
+  int slip_count_ = 0;
+  double yaw_rate_of(double v, double delta) const;
+  void update_grip(double t_arr);
 };
 
 }  // namespace mpc_tc
