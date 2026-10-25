@@ -59,6 +59,7 @@ install(PROGRAMS
   scripts/localization_monitor.py
   scripts/sim_vesc_bridge.py
   scripts/live_status.py
+  scripts/scan_for_slam.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

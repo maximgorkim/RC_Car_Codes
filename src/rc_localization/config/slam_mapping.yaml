@@ -1,0 +1,63 @@
+# slam_toolbox (sync) for mapping, used by launch/mapping.launch.py.
+# Checked on a synthetic bag with ground truth (tools/synth, 2026-10-25): driven at
+# 1 m/s the map trajectory is 9.9-11.8 cm from the truth after a rigid alignment, at
+# 2 m/s 15.3 cm (p95 36) -> map slowly. The particle filter on the map made this way:
+# 4.2 cm over the whole run, 2.3 cm within 5 s windows (1.1 cm on the true map).
+# Little effect: resolution 0.025, minimum_travel 0.1, async node, deskewed scans.
+# '/**' rather than the node name: on Foxy a node-name key wins over the launch overrides.
+/**:
+  ros__parameters:
+    odom_frame: odom                 # EKF dead reckoning (IMU + VESC), mapping.launch.py
+    map_frame: map
+    base_frame: base_link            # the scan's frame
+    scan_topic: /scan_slam           # scan_for_slam.py: invalid beams +inf instead of 0.0
+    mode: mapping
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+    map_update_interval: 2.0
+    resolution: 0.05
+    max_laser_range: 12.0            # G4 beyond ~12 m is sparse; also the raster limit
+    minimum_time_interval: 0.1
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None

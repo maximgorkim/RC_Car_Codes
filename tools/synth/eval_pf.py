@@ -6,6 +6,7 @@
 RUN.npz from particle_filter/tools/pf_replay.py on that bag. The pose is compared with the truth at
 the time it claims to describe: its stamp (scan_sync: the scan time; otherwise the update time,
 i.e. "now"). along / cross = components along / across the true heading.
+--frame x,y,yaw: the runs' map frame expressed in the truth frame (a SLAM-made map has its own frame).
 """
 import argparse
 import math
@@ -19,6 +20,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('bag')
 ap.add_argument('runs', nargs='+')
 ap.add_argument('--skip', type=float, default=3.0, help='s after the start not evaluated (convergence)')
+ap.add_argument('--frame', default='0,0,0', help='x,y,yaw of the runs\' map frame in the truth frame')
 a = ap.parse_args()
 
 r = rosbag2_py.SequentialReader()
@@ -45,6 +47,8 @@ for f in a.runs:
     ts = np.where(np.isfinite(c['pub_stamp']), c['pub_stamp'], c['t'])
     k = (ts > tt[0] + a.skip) & (ts < tt[-1])
     ts, x, y, yaw = ts[k], c['x'][k], c['y'][k], c['yaw'][k]
+    fx, fy, fp = map(float, a.frame.split(','))
+    x, y, yaw = fx + x * math.cos(fp) - y * math.sin(fp), fy + x * math.sin(fp) + y * math.cos(fp), yaw + fp
     gx, gy, gp = np.interp(ts, tt, tx), np.interp(ts, tt, ty), np.interp(ts, tt, tp)
     ex, ey = x - gx, y - gy
     along = ex * np.cos(gp) + ey * np.sin(gp)
