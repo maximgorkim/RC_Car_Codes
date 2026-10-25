@@ -16,6 +16,8 @@ Sensors (as measured on the car, 2026-10):
   /localization/twist_with_cov  twist_estimator output (VESC speed + IMU yaw rate), 197 Hz
   /pf/pose/odom  ONE message: the true start pose (pf_replay initialises from it)
   /truth/odom    ground truth of base_link, 50 Hz (evaluation only)
+  /tf            odom -> base_link, 50 Hz: VESC + gyro dead reckoning started at the TRUE start pose
+                 (so a SLAM map frame coincides with the truth frame); /odom the same as Odometry
 """
 import argparse
 import math
@@ -32,6 +34,8 @@ import range_libc
 from geometry_msgs.msg import TwistWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Imu, LaserScan
+from geometry_msgs.msg import TransformStamped
+from tf2_msgs.msg import TFMessage
 from vesc_msgs.msg import VescStateStamped
 
 ap = argparse.ArgumentParser()
@@ -85,7 +89,8 @@ w.open(rosbag2_py.StorageOptions(uri=a.out, storage_id='sqlite3'), rosbag2_py.Co
 for name, typ in [('/scan', 'sensor_msgs/msg/LaserScan'), ('/zed2/zed_node/odom', 'nav_msgs/msg/Odometry'),
                   ('/zed2/zed_node/imu/data', 'sensor_msgs/msg/Imu'), ('/sensors/core', 'vesc_msgs/msg/VescStateStamped'),
                   ('/localization/twist_with_cov', 'geometry_msgs/msg/TwistWithCovarianceStamped'),
-                  ('/pf/pose/odom', 'nav_msgs/msg/Odometry'), ('/truth/odom', 'nav_msgs/msg/Odometry')]:
+                  ('/pf/pose/odom', 'nav_msgs/msg/Odometry'), ('/truth/odom', 'nav_msgs/msg/Odometry'),
+                  ('/tf', 'tf2_msgs/msg/TFMessage'), ('/odom', 'nav_msgs/msg/Odometry')]:
     w.create_topic(rosbag2_py.TopicMetadata(name=name, type=typ, serialization_format='cdr'))
 
 T_BASE = 1.8e9  # bag clock (as a wall time)
@@ -191,6 +196,27 @@ for t in np.arange(t_start, t_end, 1 / 197.0):
     tw.twist.twist.angular.z = float(wz)
     tw.twist.covariance[0], tw.twist.covariance[35] = 0.01, 0.0004
     events.append((t + 0.006, '/localization/twist_with_cov', tw))
+# wheel + gyro dead reckoning (what twist_estimator gives), 1 kHz integration, published at 50 Hz
+dx_, dy_, dth_ = x0, y0, p0
+tt_ = np.arange(t_start, t_end, 0.001)
+_, _, _, vv_, rr_ = truth(tt_)
+gb = 0.002 * rng.normal()
+vmeas = vv_ / pose_per_vesc * erpm_per_mps / 2080.0
+wmeas = rr_ + gb
+for i in range(len(tt_)):
+    th = dth_ + 0.5 * wmeas[i] * 0.001
+    dx_ += vmeas[i] * math.cos(th) * 0.001
+    dy_ += vmeas[i] * math.sin(th) * 0.001
+    dth_ += wmeas[i] * 0.001
+    if i % 20 == 0:
+        tf = TransformStamped()
+        stamp(tf, tt_[i])
+        tf.header.frame_id, tf.child_frame_id = 'odom', 'base_link'
+        tf.transform.translation.x, tf.transform.translation.y = dx_, dy_
+        q = quat(dth_)
+        tf.transform.rotation.z, tf.transform.rotation.w = q[2], q[3]
+        events.append((tt_[i] + 0.001, '/tf', TFMessage(transforms=[tf])))
+        events.append((tt_[i] + 0.001, '/odom', odom(tt_[i], dx_, dy_, dth_)))
 for t in np.arange(t_start, t_end, 0.02):
     _, _, _, v, _ = truth(t)
     vs = VescStateStamped()
