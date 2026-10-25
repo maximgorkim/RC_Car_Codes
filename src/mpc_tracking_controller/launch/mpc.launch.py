@@ -39,6 +39,11 @@ def setup(context):
         over.update({"pose_latency_from_stamp": True,
                      "model.pose_latency_position": 0.025,
                      "model.pose_latency_heading": 0.025})
+    # wet / dusty floor: slide detection + grip-limited MPC (config grip.*)
+    if LaunchConfiguration("slippery").perform(context) == "true":
+        over["grip.adaptation"] = True
+    if LaunchConfiguration("understeer_learning").perform(context) == "true":
+        over["understeer.tau"] = 5.0
     for name in ("v_max", "a_lat_max"):  # optional overrides of the config's speed limits
         value = LaunchConfiguration(name).perform(context)
         if value:
@@ -65,6 +70,10 @@ def generate_launch_description():
         DeclareLaunchArgument("localization", default_value="pf", description="pf | ekf (see above)"),
         DeclareLaunchArgument("pf_scan_sync", default_value="false",
                               description="true with particle_filter scan_sync:=true (latency from the pose stamp)"),
+        DeclareLaunchArgument("slippery", default_value="false",
+                              description="true on a wet / dusty floor: slide detection, grip-limited MPC"),
+        DeclareLaunchArgument("understeer_learning", default_value="false",
+                              description="true: learn the understeer online (model.understeer)"),
         DeclareLaunchArgument("v_max", default_value="", description="m/s, override the config's speed limit"),
         DeclareLaunchArgument("a_lat_max", default_value="",
                               description="m/s^2, override the curve speed cap sqrt(a_lat_max/|kappa|)"),

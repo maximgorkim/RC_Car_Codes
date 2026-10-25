@@ -49,7 +49,7 @@
       max: 0.03                # rad
       min_speed: 0.5           # m/s
       max_delta: 0.06          # rad, only near straight driving
-    # Slippery floor (wet / dusty): slide detection from the IMU yaw rate vs the model, grip estimate,
+    # Slippery floor (wet / dusty), mpc.launch.py slippery:=true: slide detection from the IMU yaw rate vs the model, grip estimate,
     # and the MPC's limits from it (lateral-acceleration cap, braking-distance cap over the horizon,
     # friction circle for the rear-driven car). Off by default. tools/stack_sim, dynamic tyre plant,
     # 3 m/s, 16 seeds: uniform mu 0.5 crashes 16/16 -> 1/16, a wet stretch (mu 0.35) 16/16 -> 0/16,
@@ -59,12 +59,16 @@
       nominal: 1.0             # g, the floor a_lat_max / v_rate_max were made for (assumed)
       min: 0.15                # g
       margin: 0.8              # use this fraction of the estimate
-      recover_tau: 30.0        # s back towards nominal without slides
+      recover_tau: 30.0        # s back towards nominal while not cornering hard
+      probe_tau: 5.0           # s back towards nominal while cornering at >= probe_level without a
+      probe_level: 0.6         #   slide (left the wet stretch); 2 s: re-entry crashes, 1e9: no probing
+      slip_filter_tau: 0.04    # s, slide test on every IMU sample
+      slip_min_time: 0.08      # s the mismatch must last
       drive_axle_load: 0.5     # rear (driven) axle share of the weight
       slip_rel: 0.15           # slide: |r_model - r_imu| > slip_rel |r_model| + slip_abs
       slip_abs: 0.08           # rad/s (model RMSE on the bags 0.06-0.07)
       slip_min_speed: 0.8      # m/s
-    # Online understeer (model.understeer, yaw rate = v tan(d) / (L (1 + k v^2))) from the IMU while
+    # Online understeer, mpc.launch.py understeer_learning:=true (model.understeer, yaw rate = v tan(d) / (L (1 + k v^2))) from the IMU while
     # gripping; 0 = off. stack_sim dynamic plant at 3 m/s: 11.0 -> 9.5 cm, same lap time.
     understeer:
       tau: 0.0                 # s

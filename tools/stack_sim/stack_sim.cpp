@@ -208,7 +208,8 @@ int main(int argc, char** argv) {
       {"mpc.max_e_psi", &cp.mpc.max_e_psi}, {"mpc.control_period", &cp.control_period},
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
       {"mpc.grip", &grip_on}, {"mpc.grip_margin", &cp.grip_margin}, {"mpc.grip_recover_tau", &cp.grip_recover_tau},
-      {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.understeer", &cp.model.understeer}, {"mpc.understeer_tau", &cp.understeer_tau},
+      {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.grip_probe_tau", &cp.grip_probe_tau}, {"mpc.grip_probe_level", &cp.grip_probe_level},
+      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.understeer", &cp.model.understeer}, {"mpc.understeer_tau", &cp.understeer_tau},
       {"tyre_cs", &tyre_cs}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
   };
   for (auto it = kv.begin(); it != kv.end();) {

@@ -88,6 +88,10 @@ class MpcNode : public rclcpp::Node {
     p.slip_rel = D("grip.slip_rel", p.slip_rel);
     p.slip_abs = D("grip.slip_abs", p.slip_abs);
     p.slip_min_speed = D("grip.slip_min_speed", p.slip_min_speed);
+    p.slip_filter_tau = D("grip.slip_filter_tau", p.slip_filter_tau);
+    p.slip_min_time = D("grip.slip_min_time", p.slip_min_time);
+    p.grip_probe_level = D("grip.probe_level", p.grip_probe_level);
+    p.grip_probe_tau = D("grip.probe_tau", p.grip_probe_tau);
     p.model.understeer = D("model.understeer", p.model.understeer);
     p.understeer_tau = D("understeer.tau", p.understeer_tau);
     p.understeer_max = D("understeer.max", p.understeer_max);

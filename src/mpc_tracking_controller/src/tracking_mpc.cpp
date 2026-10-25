@@ -285,6 +285,7 @@ double TrackingController::eff_to_steer(double de) const {
 void TrackingController::on_imu(double t, double r) {
   imu_.emplace_back(t, r);
   while (!imu_.empty() && imu_.front().first < t - 2.0) imu_.pop_front();
+  if (p_.grip_adaptation) detect_slip(t, r);
 }
 
 void TrackingController::on_speed(double t, double v) {
@@ -335,43 +336,60 @@ double TrackingController::yaw_rate_of(double v, double delta) const {
   return v * std::tan(delta) / (p_.model.wheelbase * (1.0 + understeer_ * v * v));
 }
 
+void TrackingController::detect_slip(double t, double r) {
+  if (vel_.empty() || !steer_.initialised()) return;
+  const double dt = last_imu_t_ < 0.0 ? 0.0 : std::clamp(t - last_imu_t_, 0.0, 0.05);
+  last_imu_t_ = t;
+  const double a = 1.0 - std::exp(-dt / p_.slip_filter_tau), v = vel_.back().second;
+  rf_ += (r - rf_) * a;
+  rmf_ += (yaw_rate_of(v, steer_to_eff(steer_.value_at(t)) + steer_offset_) - rmf_) * a;
+  // the car turns less than the model (front saturated: plows) while asked for a real turn, or
+  // more (rear saturated: spins)
+  const double tol = p_.slip_rel * std::fabs(rmf_) + p_.slip_abs, sgn = rmf_ >= 0.0 ? 1.0 : -1.0;
+  const bool plow = std::fabs(v * rmf_) > 0.1 * 9.81 && sgn * (rmf_ - rf_) > tol;
+  const bool spin = std::fabs(rf_) > 0.3 && sgn * (rf_ - rmf_) > tol;
+  const double reached = std::fabs(v * rf_) / 9.81;  // g, lateral acceleration the car achieves
+  if (v > p_.slip_min_speed && (plow || spin)) {
+    if (slip_time_ == 0.0) {
+      grip_before_ = grip_;
+      episode_max_ = 0.0;
+    }
+    slip_time_ += dt;
+    // the grip is the most the car reached during the slide (transients through it reach less)
+    episode_max_ = std::max(episode_max_, reached);
+    slipping_ = slip_time_ >= p_.slip_min_time;
+    if (slipping_) grip_ = std::clamp(std::min(grip_before_, episode_max_), p_.grip_min, p_.grip_nominal);
+  } else {
+    slip_time_ = 0.0;
+    slipping_ = false;
+    // probe only while the yaw rate clearly matches the model (half the slide tolerance): a car that
+    // is already sliding a little is no evidence that the grip is back
+    const bool gripping = std::fabs(rf_ - rmf_) < 0.5 * tol;
+    const double tau = gripping && reached >= p_.grip_probe_level * grip_ ? p_.grip_probe_tau : p_.grip_recover_tau;
+    grip_ += (p_.grip_nominal - grip_) * (1.0 - std::exp(-dt / tau));
+  }
+}
+
 void TrackingController::update_grip(double t_arr) {
   if ((!p_.grip_adaptation && p_.understeer_tau <= 0.0) || vel_.empty()) return;
   const double dt = last_grip_t_ < 0.0 ? 0.0 : std::min(t_arr - last_grip_t_, 0.5);
   last_grip_t_ = t_arr;
+  if (p_.grip_adaptation) {
+    const double g = p_.grip_margin * grip_ * 9.81;
+    mpc_.set_grip_limits(std::min(p_.mpc.a_lat_max, g), std::min(p_.mpc.v_rate_max, g * p_.mpc.drive_axle_load), g);
+  }
+  if (p_.understeer_tau <= 0.0) return;
   const double t1 = t_arr - 0.05, t0 = t1 - 0.1, tm = 0.5 * (t0 + t1);
   double r = 0.0;
   if (!imu_mean(t0, t1, r)) return;
   const double v = sample(vel_, tm);
   const double delta = steer_to_eff(steer_.value_at(tm)) + steer_offset_;
   const double r_model = yaw_rate_of(v, delta);
-  const double tol = p_.slip_rel * std::fabs(r_model) + p_.slip_abs;
-  // the car turns less than the model (front saturated: plows) while asked for a real turn, or
-  // more (rear saturated: spins)
-  const double sgn = r_model >= 0.0 ? 1.0 : -1.0;
-  const bool plow = std::fabs(v * r_model) > 0.1 * 9.81 && sgn * (r_model - r) > tol;
-  const bool spin = std::fabs(r) > 0.3 && sgn * (r - r_model) > tol;
-  const bool slip = v > p_.slip_min_speed && (plow || spin);
-
-  if (p_.grip_adaptation) {
-    if (slip) {
-      if (slip_count_ == 0) {
-        grip_before_ = grip_;
-        episode_max_ = 0.0;
-      }
-      // two windows in a row (0.2 s): one-off gyro / disturbance spikes are not a slide. The grip is
-      // the most the car reached during the slide (transients through the slide reach less).
-      episode_max_ = std::max(episode_max_, std::fabs(v * r) / 9.81);
-      if (++slip_count_ >= 2) grip_ = std::clamp(std::min(grip_before_, episode_max_), p_.grip_min, p_.grip_nominal);
-    } else {
-      slip_count_ = 0;
-      grip_ += (p_.grip_nominal - grip_) * (1.0 - std::exp(-dt / p_.grip_recover_tau));
-    }
-    const double g = p_.grip_margin * grip_ * 9.81;
-    mpc_.set_grip_limits(std::min(p_.mpc.a_lat_max, g), std::min(p_.mpc.v_rate_max, g * p_.mpc.drive_axle_load), g);
-  }
-  if (p_.understeer_tau > 0.0 && !slip && v > 1.2 && std::fabs(r) > 0.3 && std::fabs(std::tan(delta)) > 0.05 &&
-      r * delta > 0.0) {
+  // learn only while the tyres clearly grip: no slide by the same test (without the grip feature
+  // too), and not on a floor already found slippery (a wet floor's plowing is no understeer)
+  const bool slip = slip_time_ > 0.0 || grip_ < 0.9 * p_.grip_nominal ||
+                    std::fabs(r_model - r) > p_.slip_rel * std::fabs(r_model) + p_.slip_abs + 0.1;
+  if (!slip && v > 1.2 && std::fabs(r) > 0.3 && std::fabs(std::tan(delta)) > 0.05 && r * delta > 0.0) {
     // r = v tan(d) / (L (1 + k v^2))  ->  k = (v tan(d) / (L r) - 1) / v^2
     const double k = (v * std::tan(delta) / (p_.model.wheelbase * r) - 1.0) / (v * v);
     understeer_ += (std::clamp(k, 0.0, p_.understeer_max) - understeer_) * (1.0 - std::exp(-dt / p_.understeer_tau));
@@ -386,7 +404,7 @@ void TrackingController::update_steer_offset(double t_arr) {
   double r_mean = 0.0;
   if (!imu_mean(t0, t1, r_mean)) return;
   // a sliding car says nothing about the servo trim
-  if (slip_count_ > 0) return;
+  if (slip_time_ > 0.0) return;
   const double tm = 0.5 * (t0 + t1), v = sample(vel_, tm);
   const double d_model = steer_to_eff(steer_.value_at(tm));
   const double dt = last_offset_t_ < 0.0 ? 0.0 : std::min(t_arr - last_offset_t_, 0.5);

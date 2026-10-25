@@ -160,6 +160,15 @@ struct ControllerParams {
   double slip_rel = 0.15;         // saturation: |r_model - r_imu| > slip_rel |r_model| + slip_abs
   double slip_abs = 0.08;         // rad/s, above the model / IMU noise (validated RMSE 0.06-0.07)
   double slip_min_speed = 0.8;    // m/s
+  // The slide test runs on every IMU sample: yaw rate and model both low-passed with slip_filter_tau,
+  // a slide once the mismatch has lasted slip_min_time.
+  double slip_filter_tau = 0.04;  // s
+  double slip_min_time = 0.08;    // s
+  // Leaving the slippery stretch: cornering at >= grip_probe_level of the estimate without a slide
+  // is evidence that the grip is back, the estimate then recovers with grip_probe_tau (else with
+  // grip_recover_tau). If it was not back the next slide pulls it down again within ~0.1 s.
+  double grip_probe_level = 0.6;
+  double grip_probe_tau = 5.0;    // s (stack_sim wet stretch: 2 s crashed 3-5/16 on re-entry, 5 s 0/16)
   // Online understeer estimate (model.understeer) from yaw rate vs steering while gripping, low-passed
   // with this time constant [s]; 0 = off. Saturation is then judged against the learned model, so
   // the tyres' normal (linear) understeer is not taken for a slide.
@@ -197,7 +206,7 @@ class TrackingController {
   double steer_offset() const { return steer_offset_; }
   double grip() const { return grip_; }  // g, current estimate (grip_nominal when off)
   double understeer() const { return understeer_; }
-  bool slipping() const { return slip_count_ > 0; }
+  bool slipping() const { return slipping_; }
 
  private:
   double sample(const std::deque<std::pair<double, double>>& buf, double t) const;
@@ -215,7 +224,9 @@ class TrackingController {
   bool imu_mean(double t0, double t1, double& r) const;
   double grip_ = 1.0, last_grip_t_ = -1.0, grip_before_ = 1.0, episode_max_ = 0.0;
   double understeer_ = 0.0;
-  int slip_count_ = 0;
+  double rf_ = 0.0, rmf_ = 0.0, last_imu_t_ = -1.0, slip_time_ = 0.0;
+  bool slipping_ = false;
+  void detect_slip(double t, double r);
   double yaw_rate_of(double v, double delta) const;
   void update_grip(double t_arr);
 };
