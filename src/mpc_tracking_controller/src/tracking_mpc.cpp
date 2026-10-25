@@ -288,6 +288,30 @@ void TrackingController::on_command_sent(double t, double v_cmd, double d_cmd) {
   last_d_cmd_ = d_cmd;
 }
 
+void TrackingController::update_steer_offset(double t_arr) {
+  if (p_.steer_offset_tau <= 0.0 || imu_.empty() || vel_.empty()) return;
+  // the last 0.1 s, 50 ms back so that the IMU and VESC samples around it have arrived
+  const double t1 = t_arr - 0.05, t0 = t1 - 0.1;
+  if (imu_.back().first < t1 || imu_.front().first > t0) return;
+  double r_sum = 0.0;
+  int n = 0;
+  for (const auto& s : imu_)
+    if (s.first >= t0 && s.first <= t1) {
+      r_sum += s.second;
+      ++n;
+    }
+  if (n < 5) return;
+  const double tm = 0.5 * (t0 + t1), v = sample(vel_, tm);
+  const double d_model = steer_to_eff(steer_.value_at(tm));
+  const double dt = last_offset_t_ < 0.0 ? 0.0 : std::min(t_arr - last_offset_t_, 0.5);
+  last_offset_t_ = t_arr;
+  if (v < p_.steer_offset_min_speed || std::fabs(d_model) > p_.steer_offset_max_delta) return;
+  // the angle that explains the measured yaw rate, minus the one the model assumes
+  const double implied = std::atan(r_sum / n * p_.model.wheelbase / v) - d_model;
+  steer_offset_ += (implied - steer_offset_) * (1.0 - std::exp(-dt / p_.steer_offset_tau));
+  steer_offset_ = std::clamp(steer_offset_, -p_.steer_offset_max, p_.steer_offset_max);
+}
+
 ControlOutput TrackingController::on_pose(double t_arr, double px, double py, double yaw, double v_ref,
                                           double pose_age) {
   ControlOutput o;
@@ -315,7 +339,8 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   const double t_start = t_arr + std::max(p_.compute_delay, compute_ema_) + p_.steer_dead_time;
   const double h = 0.005;
   const bool imu_ok = p_.use_imu && !imu_.empty() && imu_.back().first > t_arr - 0.2;
-  auto delta_at = [&](double t) { return steer_to_eff(steer_.value_at(t)); };
+  update_steer_offset(t_arr);
+  auto delta_at = [&](double t) { return steer_to_eff(steer_.value_at(t)) + steer_offset_; };
   auto yaw_rate_model = [&](double t, double v) { return v * std::tan(delta_at(t)) / L; };
   // heading at the position's time: back-integrate the IMU over [t_pos, t_hdg]
   double psi = yaw + p_.heading_bias;
@@ -354,7 +379,7 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   path.project(px, py, yaw);
 
   // ---- MPC
-  o.mpc = mpc_.solve(o.x0, o.s0, v_ref, path, last_v_cmd_, steer_to_eff(last_d_cmd_));
+  o.mpc = mpc_.solve(o.x0, o.s0, v_ref, path, last_v_cmd_, steer_to_eff(last_d_cmd_) + steer_offset_);
   if (!o.mpc.ok) {
     o.status = Status::kAbort;
     return o;
@@ -362,7 +387,7 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   // command limits exactly as the IRL node: box, rate per control period
   const double rv = p_.mpc.v_rate_max * p_.control_period, rd = p_.mpc.delta_rate_max * p_.control_period;
   o.v_cmd = std::min(std::max(o.mpc.v_cmd, std::max(p_.mpc.v_min, last_v_cmd_ - rv)), std::min(p_.mpc.v_max, last_v_cmd_ + rv));
-  const double d = eff_to_steer(o.mpc.delta_eff);
+  const double d = eff_to_steer(o.mpc.delta_eff - steer_offset_);
   o.delta_cmd = std::min(std::max(d, std::max(-p_.delta_cmd_max, last_d_cmd_ - rd)), std::min(p_.delta_cmd_max, last_d_cmd_ + rd));
   o.status = Status::kOk;
   pending_arrival_ = t_arr;

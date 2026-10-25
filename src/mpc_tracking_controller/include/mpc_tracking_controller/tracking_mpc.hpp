@@ -125,6 +125,13 @@ struct ControllerParams {
   double control_period = 0.1;           // s, rate limits per step as the IRL node
   double abort_e_lat = 0.8, abort_e_psi = 1.0;
   bool use_imu = true;                   // dead-reckon the latency window with the IMU yaw rate
+  // Online steering-offset (servo trim) estimate: the IMU yaw rate vs the model's v tan(delta) / L
+  // near straight driving, low-passed with this time constant [s]; 0 = off (no offset, as before).
+  // The bags show 0.002-0.010 rad of residual trim that changes between sessions.
+  double steer_offset_tau = 0.0;
+  double steer_offset_max = 0.03;        // rad, |estimate| bound
+  double steer_offset_min_speed = 0.5;   // m/s, below this the yaw rate says little about the angle
+  double steer_offset_max_delta = 0.06;  // rad, only near straight driving (understeer, map errors)
 };
 
 enum class Status { kOk, kNoPath, kNoSpeed, kAbort };
@@ -154,6 +161,7 @@ class TrackingController {
   void reset_mpc() { mpc_.reset(); }
   double steer_to_eff(double d_cmd) const;
   double eff_to_steer(double d_eff) const;
+  double steer_offset() const { return steer_offset_; }
 
  private:
   double sample(const std::deque<std::pair<double, double>>& buf, double t) const;
@@ -165,6 +173,8 @@ class TrackingController {
   double last_v_cmd_ = 0.0, last_d_cmd_ = 0.0;
   double compute_ema_ = 0.0;   // measured pose-arrival -> publication delay (exp. moving average)
   double pending_arrival_ = -1.0;
+  double steer_offset_ = 0.0, last_offset_t_ = -1.0;
+  void update_steer_offset(double t_arr);
 };
 
 }  // namespace mpc_tc

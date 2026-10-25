@@ -128,3 +128,37 @@ int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// Straight driving where the car turns more than the model says (a servo trim): the yaw rate the
+// IMU measures exceeds v tan(delta) / L, and the estimate converges to the trim. Off by default.
+TEST(TrackingController, SteeringOffsetEstimate) {
+  std::vector<double> x, y;
+  for (int i = 0; i <= 400; ++i) {
+    x.push_back(0.1 * i);
+    y.push_back(0.0);
+  }
+  for (double tau : {0.0, 2.0}) {
+    ControllerParams p;
+    p.steer_offset_tau = tau;
+    TrackingController c(p);
+    c.set_path(x, y);
+    const double trim = 0.01, v = 1.5, L = p.model.wheelbase;
+    double t = 0.0, d_cmd = 0.0;
+    for (int k = 0; k < 150; ++k) {  // 15 s at the control period
+      for (int i = 0; i < 20; ++i) {
+        t += 0.005;
+        c.on_imu(t, v * std::tan(c.steer_to_eff(d_cmd) + trim) / L);
+        c.on_speed(t, v);
+      }
+      const ControlOutput o = c.on_pose(t, 0.1 * k * v + 1.0, 0.0, 0.0, v);
+      ASSERT_EQ(o.status, Status::kOk);
+      d_cmd = 0.0;  // hold the servo straight: only the estimate is tested here
+      c.on_command_sent(t, o.v_cmd, d_cmd);
+    }
+    if (tau > 0.0) {
+      EXPECT_NEAR(c.steer_offset(), trim, 1e-3);
+    } else {
+      EXPECT_EQ(c.steer_offset(), 0.0);
+    }
+  }
+}

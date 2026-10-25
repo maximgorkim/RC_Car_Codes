@@ -11,7 +11,8 @@
 //   out  motor_topic       std_msgs/Float64         v_cmd * speed_cmd_per_mps (ERPM)
 //        servo_topic       std_msgs/Float64         servo_center + delta * servo_per_rad (clamped)
 //        /mpc/state        std_msgs/Float64MultiArray  [pose stamp, e_lat, e_psi, x0 (4), s0, v_ref,
-//                                                   v_cmd, delta_cmd, solve ms, QP iterations, converged]
+//                                                   v_cmd, delta_cmd, solve ms, QP iterations, converged,
+//                                                   steering offset estimate]
 // One control step per pose message (decimated to control_period).
 #include <algorithm>
 #include <chrono>
@@ -77,6 +78,10 @@ class MpcNode : public rclcpp::Node {
     p.steer_map_eff = this->declare_parameter<std::vector<double>>("model.steer_map_eff", p.steer_map_eff);
     p.pose_latency_position = D("model.pose_latency_position", p.pose_latency_position);
     p.pose_latency_heading = D("model.pose_latency_heading", p.pose_latency_heading);
+    p.steer_offset_tau = D("steer_offset.tau", p.steer_offset_tau);
+    p.steer_offset_max = D("steer_offset.max", p.steer_offset_max);
+    p.steer_offset_min_speed = D("steer_offset.min_speed", p.steer_offset_min_speed);
+    p.steer_offset_max_delta = D("steer_offset.max_delta", p.steer_offset_max_delta);
     p.heading_bias = D("model.heading_bias", p.heading_bias);
     p.compute_delay = D("model.compute_delay", p.compute_delay);
     p.use_imu = this->declare_parameter<bool>("use_imu", p.use_imu);
@@ -252,7 +257,7 @@ class MpcNode : public rclcpp::Node {
     stat_nc_ += o.mpc.qp_converged ? 0 : 1;
     std_msgs::msg::Float64MultiArray st;
     st.data = {stamp, o.meas.e_lat, o.meas.e_psi, o.x0[0], o.x0[1], o.x0[2], o.x0[3], o.s0, v_ref,
-               o.v_cmd, o.delta_cmd, ms, static_cast<double>(o.mpc.qp_iterations), o.mpc.qp_converged ? 1.0 : 0.0};
+               o.v_cmd, o.delta_cmd, ms, static_cast<double>(o.mpc.qp_iterations), o.mpc.qp_converged ? 1.0 : 0.0, ctrl_->steer_offset()};
     pub_state_->publish(st);
   }
 

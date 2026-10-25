@@ -40,6 +40,15 @@
     a_lat_max: 2.0             # m/s^2, speed cap sqrt(a_lat_max / |kappa|)
     control_period: 0.1        # s, rate limits per control step (as the IRL node)
     use_imu: true
+    # Online servo-trim estimate (IMU yaw rate vs the model near straight driving), low-passed
+    # with tau [s]; 0 = off. The 2026-10 bags show 0.002-0.010 rad of residual trim that changes
+    # between sessions; tools/stack_sim: 0.01 rad trim leaves 2.6 cm of steady offset on straights,
+    # 1.0 cm with tau 3 (= no trim).
+    steer_offset:
+      tau: 0.0
+      max: 0.03                # rad
+      min_speed: 0.5           # m/s
+      max_delta: 0.06          # rad, only near straight driving
 
     model:
       wheelbase: 0.28          # m, in pose units (servo_per_rad calibrated for L = 0.28)
