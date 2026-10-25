@@ -1,6 +1,6 @@
 # slam_toolbox (sync) for mapping, used by launch/mapping.launch.py.
 # Checked on a synthetic bag with ground truth (tools/synth, 2026-10-25): driven at
-# 1 m/s the map trajectory is 9.9-11.8 cm from the truth after a rigid alignment, at
+# 1 m/s the map trajectory is 10-13 cm from the truth after a rigid alignment, at
 # 2 m/s 15.3 cm (p95 36) -> map slowly. The particle filter on the map made this way:
 # 4.2 cm over the whole run, 2.3 cm within 5 s windows (1.1 cm on the true map).
 # Little effect: resolution 0.025, minimum_travel 0.1, async node, deskewed scans.

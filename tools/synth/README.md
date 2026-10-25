@@ -22,3 +22,13 @@ Results (2026-10-25, 2.5 m/s, PC CPU ray marching): B mode 4.0 cm / 1.16 deg -> 
 + 2000 particles + deskew 1.6 cm / 0.21 deg at half the CPU. More beams (angle_step 4) alone: no gain.
 The synthetic LiDAR stamps the first beam and orders beams by angle in time; whether the real G4
 does the same must be checked (`particle_filter/tools/deskew_check.py`) before `deskew:=true`.
+
+## slam_toolbox (slam/)
+`slam/slam_run.sh BAG OUT` runs the car's mapping chain (`rc_localization/launch/mapping.launch.py`: EKF dead
+reckoning + `scan_for_slam.py` + slam_toolbox sync) on a synthetic bag; `slam/slam_eval.py OUT...` compares
+the SLAM pose with the truth after a rigid alignment (the SLAM map has its own frame). PF on the SLAM map:
+`pf_replay.py ... --map OUT/map.yaml --init=x,y,yaw` (start pose in the SLAM frame), `eval_pf.py ... --frame x,y,yaw`.
+
+Results (2026-10-25): with the driver's 0.0 invalid beams the map falls apart (6.5 m mean error); with +inf,
+1 m/s: 10-13 cm, 2 m/s: 15 cm (p95 36). PF (best mode) on the 1 m/s SLAM map: 4.2 cm over the run, 2.3 cm
+within 5 s windows (true map 1.1 cm). Resolution 0.025, minimum_travel 0.1, async, deskewed scans: no clear gain.
