@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
       if (it->t <= tq) return *it;
     return hist.front();
   };
-  double gyro_bias = gyro_bias0, v_prev = 0.0;
+  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0;
   // dynamic plant: body velocities at the centre of gravity. Tyre data: F1TENTH single-track model
   // (C_alpha = C_S mu F_z, C_Sf 4.718, C_Sr 5.456 1/rad), scaled to this wheelbase. Mildly
   // understeering (~0.03 rad/g), i.e. kinematic at the bags' 0.1-0.3 g, as identified.
@@ -315,7 +315,7 @@ int main(int argc, char** argv) {
   std::ofstream ser;
   if (!series.empty()) {
     ser.open(series);
-    ser << "t,s,e_lat,v,delta_cmd,ekf_err,ekf_hdg_err,gyro_bias_est,yaw_bias_est,slide,grip,mu,ay\n";
+    ser << "t,s,e_lat,v,delta_cmd,ekf_err,ekf_hdg_err,gyro_bias_est,yaw_bias_est,slide,grip,mu,ay,bx,by,psi,r\n";
   }
 
   // controller step on a pose (pose = PF pose or EKF output), as mpc_node::on_odom
@@ -409,6 +409,7 @@ int main(int argc, char** argv) {
       if (t > 10.0)
         beta_max = std::max(beta_max, std::fabs(std::atan2(dvy, std::max(dvx, 0.5)) - std::atan(lr * std::tan(delta) / L)));
     }
+    r_now = r;
     t += h;
     gyro_bias += gyro_bias_rw * std::sqrt(h) * N01(rng_bias);
     hist.push_back({t, x, y, psi, v, v_wheel});
@@ -572,7 +573,8 @@ int main(int argc, char** argv) {
         ser << t << "," << tp.s << "," << tp.e_lat << "," << v << "," << last_dcmd << ","
             << (ekf_pos_err.empty() ? 0.0 : ekf_pos_err.back()) << "," << (ekf_hdg_err.empty() ? 0.0 : ekf_hdg_err.back())
             << "," << xs(rl::GYRO_BIAS) << "," << xs(rl::YAW_BIAS) << "," << slide_now << "," << ctrl.grip() << ","
-            << mu_now << "," << ay_true << "\n";
+            << mu_now << "," << ay_true << "," << x + A * std::cos(psi) << "," << y + A * std::sin(psi) << ","
+            << psi << "," << r_now << "\n";
       }
     }
   }

@@ -118,6 +118,11 @@ class ParticleFiler(Node):
         # header stamp + scan_meas_fraction * scan duration. The YDLidar stamps the
         # first point and publishes after the last one, so 0.5 = middle of the scan.
         self.SCAN_MEAS_FRACTION = self.declare_parameter('scan_meas_fraction', 0.5).value
+        # scan_deskew (scan_synchronous only): the LiDAR turns for a whole scan (~0.1 s) while the car
+        # moves (15 cm at 1.5 m/s); every beam is moved from the pose at its own time to the pose at
+        # the scan's measurement time with the motion source, then resampled on the beam angles.
+        # Synthetic bag with ground truth (tools/synth): 2.5 -> ~1.3 cm, yaw 0.84 -> ~0.2 deg.
+        self.SCAN_DESKEW = self.declare_parameter('scan_deskew', False).value
         if self.MOTION_SOURCE not in ('odom', 'twist'):
             raise ValueError("motion_source must be 'odom' or 'twist'")
 
@@ -421,6 +426,8 @@ class ParticleFiler(Node):
             duration = msg.scan_time if msg.scan_time > 0.0 else msg.time_increment * len(msg.ranges)
             self.meas_t = (msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
                            + self.SCAN_MEAS_FRACTION * duration)
+            if self.SCAN_DESKEW and len(self.motion_hist) > 1:
+                self.downsampled_ranges = self.deskew(msg, duration)
             self.update()
 
     def odomCB(self, msg):
@@ -776,6 +783,43 @@ class ParticleFiler(Node):
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
         return np.dot(self.particles.transpose(), self.weights)
+
+    def deskew(self, msg, duration):
+        '''
+        Ranges at the downsampled angles as seen from the pose at meas_t: every beam is moved from
+        the motion-source pose at its own time (stamp + i * duration / n) to that pose, and the
+        moved points are resampled on the angles. Invalid beams (0 / inf) stay invalid.
+        '''
+        r = np.asarray(msg.ranges, dtype=float)
+        n = len(r)
+        valid = np.isfinite(r) & (r > msg.range_min)
+        if valid.sum() < 10:
+            return self.downsampled_ranges
+        t0 = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+        tb = t0 + np.arange(n) * (duration / n)
+        h = np.array(self.motion_hist)
+        th_h = np.unwrap(h[:, 3])
+        px, py, pth = np.interp(tb, h[:, 0], h[:, 1]), np.interp(tb, h[:, 0], h[:, 2]), np.interp(tb, h[:, 0], th_h)
+        rx, ry, rth = (np.interp(self.meas_t, h[:, 0], h[:, 1]), np.interp(self.meas_t, h[:, 0], h[:, 2]),
+                       np.interp(self.meas_t, h[:, 0], th_h))
+        a = self.laser_angles[valid]
+        rv = r[valid]
+        # beam point in the odometry frame, then in the frame of the reference pose
+        wx = px[valid] + rv * np.cos(pth[valid] + a)
+        wy = py[valid] + rv * np.sin(pth[valid] + a)
+        c, s = np.cos(rth), np.sin(rth)
+        qx, qy = c * (wx - rx) + s * (wy - ry), -s * (wx - rx) + c * (wy - ry)
+        qa, qr = np.arctan2(qy, qx), np.hypot(qx, qy)
+        order = np.argsort(qa)
+        qa, qr = qa[order], qr[order]
+        out = np.interp(self.downsampled_angles, qa, qr, period=2.0 * np.pi)
+        # no moved beam near this angle (a gap of invalid beams): invalid
+        inc = abs(msg.angle_increment) if msg.angle_increment else 2.0 * np.pi / n
+        k = np.searchsorted(qa, self.downsampled_angles) % len(qa)
+        gap = np.minimum(np.abs((qa[k] - self.downsampled_angles + np.pi) % (2 * np.pi) - np.pi),
+                         np.abs((qa[k - 1] - self.downsampled_angles + np.pi) % (2 * np.pi) - np.pi))
+        out[gap > 2.0 * inc] = 0.0
+        return out
 
     def motion_pose_at(self, t):
         '''

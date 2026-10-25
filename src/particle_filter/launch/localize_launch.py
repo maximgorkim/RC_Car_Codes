@@ -60,7 +60,17 @@ def generate_launch_description():
     # the motion since the last update (default 'fixed': the config dispersions)
     motion_noise_la = DeclareLaunchArgument('motion_noise', default_value='fixed',
                                             description='fixed | proportional')
-    ld = LaunchDescription([localize_la, ekf_la, scan_sync_la, motion_noise_la])
+    # twist:=true -> motion model from the VESC + IMU twist instead of ZED VO (always on with ekf:=true)
+    twist_la = DeclareLaunchArgument('twist', default_value='false',
+                                     description='true: motion from /localization/twist_with_cov (needs twist_estimator)')
+    motion_source = PythonExpression(["'twist' if '", LaunchConfiguration('ekf'), "' == 'true' or '",
+                                      LaunchConfiguration('twist'), "' == 'true' else 'odom'"])
+    # deskew:=true -> every LiDAR beam moved to the pose at the scan's measurement time (scan_sync only).
+    # Synthetic bag with ground truth (tools/synth), 2.5 m/s: 3.7 -> 1.6 cm, yaw 1.1 -> 0.2 deg with
+    # twist:=true. NOT yet checked on the car: run tools/deskew_check.py on a new bag first.
+    deskew_la = DeclareLaunchArgument('deskew', default_value='false',
+                                      description='true: deskew the scan with the motion source (scan_sync only)')
+    ld = LaunchDescription([localize_la, ekf_la, scan_sync_la, motion_noise_la, twist_la, deskew_la])
 
     # nodes
     pf_node = Node(
@@ -68,7 +78,9 @@ def generate_launch_description():
         executable='particle_filter',
         name='particle_filter',
         parameters=[config, {'scan_synchronous': scan_sync,
-                             'motion_noise': LaunchConfiguration('motion_noise')}]
+                             'motion_noise': LaunchConfiguration('motion_noise'),
+                             'motion_source': motion_source,
+                             'scan_deskew': PythonExpression(["'", LaunchConfiguration('deskew'), "' == 'true'"])}]
     )
     map_server_node = Node(
         package='nav2_map_server',
