@@ -175,6 +175,57 @@ void check_jacobian(bool lateral)
 TEST(EkfCore, JacobianMatchesNumeric) { check_jacobian(false); }
 TEST(EkfCore, JacobianMatchesNumericLateral) { check_jacobian(true); }
 
+// Pose with an older position: h = [p - d u(x), yaw]. The measurement Jacobian
+// is recovered from the update itself (P = s I, s tiny, R = I: dx = s H^T y)
+// and compared with the numeric derivative of h.
+void check_position_delay(bool lateral)
+{
+  EkfParams p;
+  p.lateral_dynamics = lateral;
+  p.pose_gate = 0.0;
+  StateVec x0;
+  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2;
+  const double d = 0.04;
+  auto h = [&](const StateVec & x) {
+    const double th = x(YAW) + x(YAW_BIAS);
+    const double vl = lateral ? x(VY) : p.lever_arm * x(WZ);
+    return Eigen::Vector3d(x(X) - d * (x(VX) * std::cos(th) - vl * std::sin(th)),
+                           x(Y) - d * (x(VX) * std::sin(th) + vl * std::cos(th)), x(YAW));
+  };
+  PoseMeas m;
+  m.position_delay = d;
+  m.R = Eigen::Matrix3d::Identity();
+
+  // A measurement equal to h(x) changes nothing.
+  Ekf e(p);
+  e.x = x0;
+  e.P = 1e-8 * StateMat::Identity();
+  m.z = h(x0);
+  ASSERT_TRUE(e.update_pose(m));
+  EXPECT_LT((e.x - x0).cwiseAbs().maxCoeff(), 1e-12);
+
+  for (int i = 0; i < 3; ++i) {
+    Ekf f(p);
+    f.x = x0;
+    f.P = 1e-8 * StateMat::Identity();
+    m.z = h(x0);
+    m.z(i) += 1.0;
+    ASSERT_TRUE(f.update_pose(m));
+    const StateVec H_row = (f.x - x0) / 1e-8;
+    StateVec H_num;
+    for (int j = 0; j < NX; ++j) {
+      StateVec a = x0, b = x0;
+      a(j) += 1e-6;
+      b(j) -= 1e-6;
+      H_num(j) = (h(a)(i) - h(b)(i)) / 2e-6;
+    }
+    EXPECT_LT((H_row - H_num).cwiseAbs().maxCoeff(), 1e-3) << "row " << i;
+  }
+}
+
+TEST(EkfCore, PositionDelayJacobian) { check_position_delay(false); }
+TEST(EkfCore, PositionDelayJacobianLateral) { check_position_delay(true); }
+
 TEST(EkfCore, OutOfOrderEqualsInOrder)
 {
   // Adding a pose late (with replay) must give exactly the same result as

@@ -98,6 +98,10 @@ struct PoseMeas
   // dt is wrong by (velocity * dt) along the motion, so R is extended with
   // time_stddev^2 * u u^T, u = [dx/dt, dy/dt, dyaw/dt] from the filter state.
   double time_stddev = 0.0;
+  // The position is this much OLDER than the heading [s] (the PF's position
+  // lags its heading by ~40 ms on the bags). The position rows then compare
+  // with the state moved back along the velocity: p - position_delay * u.
+  double position_delay = 0.0;
 };
 
 struct TwistMeas

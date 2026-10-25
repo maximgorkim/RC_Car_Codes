@@ -81,7 +81,25 @@ bool Ekf::update_pose(const PoseMeas & m, double * d2)
   H(1, Y) = 1.0;
   H(2, YAW) = 1.0;
 
-  Eigen::Vector3d y = m.z - H * x;
+  Eigen::Vector3d h(x(X), x(Y), x(YAW));
+  if (m.position_delay != 0.0) {
+    // h_pos = p - d u(x), u = world velocity of base_link
+    const double d = m.position_delay;
+    const double th = x(YAW) + x(YAW_BIAS);
+    const double c = std::cos(th), s = std::sin(th), v = x(VX), vl = lateral_velocity();
+    h(0) -= d * (v * c - vl * s);
+    h(1) -= d * (v * s + vl * c);
+    const double dux_dth = -v * s - vl * c, duy_dth = v * c - vl * s;
+    H(0, YAW) = H(0, YAW_BIAS) = -d * dux_dth;
+    H(1, YAW) = H(1, YAW_BIAS) = -d * duy_dth;
+    H(0, VX) = -d * c;
+    H(1, VX) = -d * s;
+    const int lat = p_.lateral_dynamics ? VY : WZ;
+    const double dvl = p_.lateral_dynamics ? 1.0 : p_.lever_arm;
+    H(0, lat) = d * s * dvl;
+    H(1, lat) = -d * c * dvl;
+  }
+  Eigen::Vector3d y = m.z - h;
   y(2) = normalize_angle(y(2));
 
   Eigen::Matrix3d R = m.R;

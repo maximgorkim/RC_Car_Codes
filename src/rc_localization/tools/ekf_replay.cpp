@@ -12,7 +12,7 @@
 // Keys: erpm_per_mps pose_stamp_offset lever_arm q_pos q_yaw q_yaw_bias q_vx
 //   q_wz q_gyro_bias q_speed_scale pose_gate pose_min_xy pose_min_yaw
 //   speed_std yaw_rate_std init_yaw_bias init_gyro_bias init_speed_scale history
-//   output_rate pose_time_std lateral slip_tau q_vy q_ay q_ay_bias accel_std accel_scale init_ay_bias
+//   output_rate pose_time_std pose_position_delay lateral slip_tau q_vy q_ay q_ay_bias accel_std accel_scale init_ay_bias
 
 #include <cmath>
 #include <cstdio>
@@ -36,7 +36,7 @@ int main(int argc, char ** argv)
     {"erpm_per_mps", 2080.0}, {"pose_stamp_offset", 0.20}, {"pose_min_xy", 0.03}, {"pose_min_yaw", 0.015},
     {"speed_std", 0.1}, {"yaw_rate_std", 0.02}, {"init_gyro_bias", 0.0}, {"init_speed_scale", 1.0},
     {"history", 1.0}, {"output_rate", 50.0}, {"standstill_erpm", 50.0}, {"max_rejections", 15},
-    {"warmup", 5.0}, {"pose_time_std", 0.04}, {"init_yaw_bias", 0.05},
+    {"warmup", 5.0}, {"pose_time_std", 0.04}, {"pose_position_delay", 0.0}, {"init_yaw_bias", 0.05},
     {"lateral", 0.0}, {"accel_std", 1.0}, {"accel_scale", 1.0}, {"init_ay_bias", 0.0}};
   EkfParams p;
   std::map<std::string, double *> pk = {
@@ -145,11 +145,14 @@ int main(int argc, char ** argv)
       StateVec xp;
       StateMat Pp;
       ekf.state_at(t, xp, Pp);
-      const double ex = v[2] - xp(X), ey = v[3] - xp(Y);
-      const double e = std::hypot(ex, ey);
-      const double eyaw = normalize_angle(v[4] - xp(YAW));
       // Split into along-track / cross-track (timing errors show along-track).
       const double th = xp(YAW) + xp(YAW_BIAS);
+      // the position is compared with the state pose_position_delay earlier
+      const double vl = p.lateral_dynamics ? xp(VY) : p.lever_arm * xp(WZ), dpos = k["pose_position_delay"];
+      const double ex = v[2] - (xp(X) - dpos * (xp(VX) * std::cos(th) - vl * std::sin(th)));
+      const double ey = v[3] - (xp(Y) - dpos * (xp(VX) * std::sin(th) + vl * std::cos(th)));
+      const double e = std::hypot(ex, ey);
+      const double eyaw = normalize_angle(v[4] - xp(YAW));
       const double along = ex * std::cos(th) + ey * std::sin(th);
       const double cross = -ex * std::sin(th) + ey * std::cos(th);
 
@@ -161,6 +164,7 @@ int main(int argc, char ** argv)
       const double vyaw = std::max(v[7], k["pose_min_yaw"] * k["pose_min_yaw"]);
       m.pose.R = Eigen::Vector3d(vxy, vxy, vyaw).asDiagonal();
       m.pose.time_stddev = k["pose_time_std"];
+      m.pose.position_delay = k["pose_position_delay"];
       const auto r = ekf.add(m);
       ++n_pose;
       if (innov) {

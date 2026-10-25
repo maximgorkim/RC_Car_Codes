@@ -42,6 +42,9 @@
     # mean); 0.04 cut rejected poses from ~1 % to ~0.5 %. Use ~0.01 once the
     # PF stamps with the scan time.
     pose_time_stddev: 0.04
+    # s the LiDAR position is older than its heading (RC_Car_Sim car_like.json: 0.04 on fair_irl_1).
+    # The 2026-10-05 bags fit 0 best (ekf_replay sweep 0-0.06 with offsets 0.16-0.20), so 0.
+    pose_position_delay: 0.0
     twist_min_stddev_vx: 0.05
     twist_min_stddev_wz: 0.01
     max_consecutive_rejections: 15   # ~2 s of rejected PF poses -> restart from the PF

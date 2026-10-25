@@ -93,6 +93,8 @@ public:
     pose_min_stddev_xy_ = declare_parameter<double>("pose_min_stddev_xy", 0.03);
     pose_min_stddev_yaw_ = declare_parameter<double>("pose_min_stddev_yaw", 0.01);
     pose_time_stddev_ = declare_parameter<double>("pose_time_stddev", 0.0);
+    // s the LiDAR position is older than its heading (0: same time, the old behaviour)
+    pose_position_delay_ = declare_parameter<double>("pose_position_delay", 0.0);
     twist_min_stddev_vx_ = declare_parameter<double>("twist_min_stddev_vx", 0.05);
     twist_min_stddev_wz_ = declare_parameter<double>("twist_min_stddev_wz", 0.01);
     max_consecutive_rejections_ = declare_parameter<int>("max_consecutive_rejections", 15);
@@ -298,6 +300,7 @@ private:
     }
     m.pose.R = Eigen::Vector3d(var_xy, var_xy, var_yaw).asDiagonal();
     m.pose.time_stddev = pose_time_stddev_;
+    m.pose.position_delay = pose_position_delay_;
 
     double d2 = 0.0;
     int replayed = 0;
@@ -443,6 +446,7 @@ private:
   double max_extrapolation_, pose_stamp_offset_, sensor_timeout_;
   bool use_pose_covariance_;
   double pose_stddev_xy_, pose_stddev_yaw_, pose_min_stddev_xy_, pose_min_stddev_yaw_, pose_time_stddev_;
+  double pose_position_delay_;
   double twist_min_stddev_vx_, twist_min_stddev_wz_;
   int max_consecutive_rejections_;
   double max_position_variance_;
