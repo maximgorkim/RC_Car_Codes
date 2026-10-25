@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BIN = os.path.join(HERE, '..', '..', 'build', 'stack_sim', 'stack_sim')
 COLUMNS = ['elat_rms', 'elat_max', 'elat_st', 'elat_st_mean', 'elat_cu', 'steer_std_st', 'ekf_err', 'ekf_err_max',
-           'ekf_hdg', 'jump_max', 'rejected', 'resets', 'aborts', 'time']
+           'ekf_hdg', 'jump_max', 'rejected', 'resets', 'aborts', 'beta_max', 'laps', 'time']
 
 
 def run(binary, path, args):
@@ -42,7 +42,7 @@ def main():
         rows = [r for (cc, _), r in zip(jobs, res) if cc == c]
         mean = {k: sum(r[k] for r in rows) / len(rows) for k in COLUMNS}
         # the worst seed for the max metrics: one bad run matters
-        for k in ('elat_max', 'ekf_err_max', 'jump_max'):
+        for k in ('elat_max', 'ekf_err_max', 'jump_max', 'beta_max'):
             mean[k] = max(r[k] for r in rows)
         print(f'{c:<{width}}  ' + ' '.join(f'{mean[k]:>12.4f}' for k in COLUMNS))
 

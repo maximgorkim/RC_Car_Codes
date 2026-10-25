@@ -21,3 +21,15 @@ Defaults follow `RC_Car_Sim car_like.json`. Two caveats:
 * `pf_pos_extra=0.04` (position older than heading) is from fair_irl_1; the 2026-10-05 bags fit 0.
 * `smooth_loop_path3_edit.csv` is tighter than the car can steer at s ≈ 22–27 m (|κ| up to 2.1 1/m,
   the car reaches 1.2–1.3): the largest curve errors there are the path's, not the controller's.
+
+## Slippery floor (`plant=dyn`)
+`plant=dyn` replaces the kinematic car by a single-track model with Fiala tyres (F1TENTH tyre data,
+assumed mass/inertia: not identified on this car) and a friction coefficient `mu`, optionally a wet
+stretch `wet_s0..wet_s1` with `mu_wet`. `beta_max` = largest body slip beyond the kinematic one.
+`tyre_cs` scales the (assumed) cornering stiffness: check results both ways.
+
+```bash
+G="mpc.grip=1 mpc.understeer_tau=5"
+tools/stack_sim/compare.py $P --seeds 16 --common "ctrl=ekf plant=dyn speed=3 mpc.v_max=3 mpc.a_lat_max=4" -- \
+  "mu=0.5" "mu=0.5 $G" "wet_s0=15 wet_s1=30 mu_wet=0.35" "wet_s0=15 wet_s1=30 mu_wet=0.35 $G"
+```

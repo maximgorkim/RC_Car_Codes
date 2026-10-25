@@ -22,6 +22,10 @@
 //   wheel_slip=0.0             s: wheel speed = v + wheel_slip * dv/dt
 //   dist=1                     yaw disturbance of the car (car_like.json), 0 = off
 //   pf_noise=1                 scale of the PF pose errors (0 = perfect pose)
+//   plant=kin|dyn (kin)        kin: the identified kinematic car (never slides); dyn: single-track
+//                              model with Fiala tyres, friction circle at the driven rear axle
+//   mu=1.0 mu_wet=0.4          friction coefficient; mu_wet on the path stretch wet_s0..wet_s1 [m]
+//   mass=4.0 iz=0.055          kg, kg m^2 (assumed: F1TENTH-like, not identified on this car)
 //   pf_pos_extra=0.04          s the PF position is older than its heading (car_like.json; the
 //                              2026-10-05 bags fit 0 better, see ekf_replay pose_position_delay)
 //   glitch_rate=0 glitch_m=0.5 per-pose probability and size of a PF position jump
@@ -147,6 +151,17 @@ int main(int argc, char** argv) {
   const double gyro_bias0 = num("gyro_bias", 0.0), gyro_bias_rw = num("gyro_bias_rw", 0.0);
   const double trim = num("trim", 0.0), kus = num("kus", 0.0), wheel_slip = num("wheel_slip", 0.0);
   const bool dist_on = num("dist", 1) != 0.0;
+  // dynamic plant: single-track model with Fiala tyres and a friction coefficient
+  const std::string plant = str("plant", "kin");
+  if (plant != "kin" && plant != "dyn") {
+    std::fprintf(stderr, "plant=kin|dyn\n");
+    return 2;
+  }
+  const bool dyn = plant == "dyn";
+  const double mu_dry = num("mu", 1.0), mu_wet = num("mu_wet", 0.4);
+  const double wet_s0 = num("wet_s0", -1.0), wet_s1 = num("wet_s1", -1.0);  // wet stretch of the path [m]
+  const double car_mass = num("mass", 4.0), car_iz = num("iz", 0.055);
+  double tyre_cs = 1.0;  // scale of the tyre cornering stiffness (assumed values: test both ways)
   const double pf_noise = num("pf_noise", 1.0);  // scale of every PF pose error (0 = perfect pose)
   const double pf_pos_extra = num("pf_pos_extra", 0.04);  // s position older than heading (car_like.json)
   const double glitch_rate = num("glitch_rate", 0.0), glitch_m = num("glitch_m", 0.5);
@@ -178,7 +193,7 @@ int main(int argc, char** argv) {
   // ------------------------------------------------------------------ MPC (mpc_car.yaml values)
   ControllerParams cp;
   cp.mpc.v_max = speed;
-  double speed_cmd_per_mps = 2171.0, mpc_horizon = cp.mpc.horizon;
+  double speed_cmd_per_mps = 2171.0, mpc_horizon = cp.mpc.horizon, grip_on = 0.0;
 
   // generic numeric overrides: key=value for the parameters below
   std::map<std::string, double*> keys = {
@@ -191,7 +206,10 @@ int main(int argc, char** argv) {
       {"ekf.output_rate", &output_rate},
       {"mpc.v_max", &cp.mpc.v_max}, {"mpc.a_lat_max", &cp.mpc.a_lat_max}, {"mpc.max_e_lat", &cp.mpc.max_e_lat},
       {"mpc.max_e_psi", &cp.mpc.max_e_psi}, {"mpc.control_period", &cp.control_period},
-      {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
+      {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
+      {"mpc.grip", &grip_on}, {"mpc.grip_margin", &cp.grip_margin}, {"mpc.grip_recover_tau", &cp.grip_recover_tau},
+      {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.understeer", &cp.model.understeer}, {"mpc.understeer_tau", &cp.understeer_tau},
+      {"tyre_cs", &tyre_cs}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
   };
   for (auto it = kv.begin(); it != kv.end();) {
     auto k = keys.find(it->first);
@@ -204,6 +222,7 @@ int main(int argc, char** argv) {
   }
 
   cp.mpc.horizon = static_cast<int>(mpc_horizon);
+  cp.grip_adaptation = grip_on != 0.0;
   // MPC exactly as mpc_node + mpc.launch.py set it up
   if (ctrl_mode == "ekf") {
     cp.pose_latency_position = 0.0;
@@ -244,6 +263,21 @@ int main(int argc, char** argv) {
     return hist.front();
   };
   double gyro_bias = gyro_bias0, v_prev = 0.0;
+  // dynamic plant: body velocities at the centre of gravity. Tyre data: F1TENTH single-track model
+  // (C_alpha = C_S mu F_z, C_Sf 4.718, C_Sr 5.456 1/rad), scaled to this wheelbase. Mildly
+  // understeering (~0.03 rad/g), i.e. kinematic at the bags' 0.1-0.3 g, as identified.
+  const double lr = 0.145, lf = L - lr, grav = 9.81;
+  const double Fzf = car_mass * grav * lr / L, Fzr = car_mass * grav * lf / L;
+  double dvx = 0.0, dvy = 0.0, dr = 0.0, mu_now = mu_dry, ay_true = 0.0, beta_max = 0.0, slide_now = 0.0;
+  auto fiala = [](double alpha, double c_alpha, double fmax) {
+    // brush tyre: linear for small slip, saturating at fmax (= mu F_z or what the friction
+    // circle leaves) beyond alpha_sl
+    if (fmax <= 1e-9) return 0.0;
+    const double z = std::tan(alpha), zsl = 3.0 * fmax / c_alpha;
+    if (std::fabs(z) >= zsl) return std::copysign(fmax, alpha);
+    return c_alpha * z - c_alpha * c_alpha / (3.0 * fmax) * std::fabs(z) * z +
+           c_alpha * c_alpha * c_alpha / (27.0 * fmax * fmax) * z * z * z;
+  };
 
   // ------------------------------------------------------------------ event queue
   std::priority_queue<Event, std::vector<Event>, std::greater<Event>> events;
@@ -279,7 +313,7 @@ int main(int argc, char** argv) {
   std::ofstream ser;
   if (!series.empty()) {
     ser.open(series);
-    ser << "t,s,e_lat,v,delta_cmd,ekf_err,ekf_hdg_err,gyro_bias_est,yaw_bias_est\n";
+    ser << "t,s,e_lat,v,delta_cmd,ekf_err,ekf_hdg_err,gyro_bias_est,yaw_bias_est,slide,grip,mu,ay\n";
   }
 
   // controller step on a pose (pose = PF pose or EKF output), as mpc_node::on_odom
@@ -325,22 +359,63 @@ int main(int argc, char** argv) {
       dist_lp += (dist_ou.x - dist_lp) * (1.0 - std::exp(-h / 0.032));
     }
     const double delta = ctrl.steer_to_eff(steer.x) + trim + (dist_on ? dist_lp : 0.0);
-    const double v = spd.x, accel = (v - v_prev) / h;
-    v_prev = v;
-    const double r = v * std::tan(delta) / (L * (1.0 + kus * v * v));
-    x += h * v * std::cos(psi + 0.5 * h * r);
-    y += h * v * std::sin(psi + 0.5 * h * r);
-    psi += h * r;
+    double v, r, v_wheel;
+    if (!dyn) {
+      v = spd.x;
+      const double accel = (v - v_prev) / h;
+      v_prev = v;
+      r = v * std::tan(delta) / (L * (1.0 + kus * v * v));
+      x += h * v * std::cos(psi + 0.5 * h * r);
+      y += h * v * std::sin(psi + 0.5 * h * r);
+      psi += h * r;
+      v_wheel = v + wheel_slip * accel;
+      ay_true = v * r;
+    } else {
+      // the VESC regulates the wheel speed (the identified speed dynamics); the car follows through
+      // the rear tyre's longitudinal force; lateral forces from the slip angles
+      v_wheel = spd.x;
+      const double vxs = std::max(dvx, 0.5);
+      const double kappa = (v_wheel - dvx) / vxs;
+      const double fr_max = mu_now * Fzr, ff_max = mu_now * Fzf;
+      const double fx = std::clamp(20.0 * Fzr * kappa, -fr_max, fr_max);
+      const double fyr_max = std::sqrt(std::max(0.0, fr_max * fr_max - fx * fx));
+      const double af = delta - std::atan2(dvy + lf * dr, vxs), ar = -std::atan2(dvy - lr * dr, vxs);
+      const double fyf = fiala(af, tyre_cs * 4.718 * mu_now * Fzf, ff_max), fyr = fiala(ar, tyre_cs * 5.456 * mu_now * Fzr, fyr_max);
+      const double ax = (fx - fyf * std::sin(delta)) / car_mass + dvy * dr;
+      const double vyd = (fyr + fyf * std::cos(delta)) / car_mass - dvx * dr;
+      const double rd = (lf * fyf * std::cos(delta) - lr * fyr) / car_iz;
+      dvx = std::max(0.0, dvx + h * ax);
+      dvy += h * vyd;
+      dr += h * rd;
+      // below ~0.6 m/s the slip angles are ill-defined: blend into the kinematic model
+      const double w = std::clamp((dvx - 0.3) / 0.3, 0.0, 1.0);
+      const double r_kin = dvx * std::tan(delta) / L;
+      dr = w * dr + (1.0 - w) * r_kin;
+      dvy = w * dvy + (1.0 - w) * lr * r_kin;
+      ay_true = vyd + dvx * dr;
+      // move the centre of gravity, keep (x, y) = rear axle as in the kinematic plant
+      double cx = x + lr * std::cos(psi), cy = y + lr * std::sin(psi);
+      cx += h * (dvx * std::cos(psi) - dvy * std::sin(psi));
+      cy += h * (dvx * std::sin(psi) + dvy * std::cos(psi));
+      psi += h * dr;
+      x = cx - lr * std::cos(psi);
+      y = cy - lr * std::sin(psi);
+      v = dvx;
+      r = dr;
+      // slide: body slip angle beyond the kinematic one (lr tan(delta) / L at the CG)
+      slide_now = std::atan2(dvy, std::max(dvx, 0.5)) - std::atan(lr * std::tan(delta) / L);
+      if (t > 10.0)
+        beta_max = std::max(beta_max, std::fabs(std::atan2(dvy, std::max(dvx, 0.5)) - std::atan(lr * std::tan(delta) / L)));
+    }
     t += h;
     gyro_bias += gyro_bias_rw * std::sqrt(h) * N01(rng_bias);
-    const double v_wheel = v + wheel_slip * accel;
     hist.push_back({t, x, y, psi, v, v_wheel});
     while (hist.size() > 2 && hist.front().t < t - 1.5) hist.pop_front();
 
     // ---------------- sensors
     if (t >= next_imu) {
       next_imu += T_imu;
-      const double wz = r + gyro_bias + gyro_std * N01(rng_imu), ay = v * r + accel_std * N01(rng_imu);
+      const double wz = r + gyro_bias + gyro_std * N01(rng_imu), ay = ay_true + accel_std * N01(rng_imu);
       const double stamp = t;
       (void)ay;
       ctrl.on_imu(t + imu_latency, wz);  // mpc_node stamps the IMU with now() on reception
@@ -468,6 +543,10 @@ int main(int argc, char** argv) {
     if (t >= next_metric) {
       next_metric += 0.02;
       const Projection tp = truth.project(x + A * std::cos(psi), y + A * std::sin(psi), psi);
+      {
+        const double sm = std::fmod(tp.s, truth.length());
+        mu_now = (wet_s0 >= 0.0 && sm >= wet_s0 && sm <= wet_s1) ? mu_wet : mu_dry;
+      }
       double ds = tp.s - last_s;
       if (ds < -0.5 * truth.length()) ds += truth.length();
       if (ds > 0.5 * truth.length()) ds -= truth.length();
@@ -487,7 +566,8 @@ int main(int argc, char** argv) {
         const rl::StateVec xs = ekf.initialized() ? ekf.state() : rl::StateVec::Zero();
         ser << t << "," << tp.s << "," << tp.e_lat << "," << v << "," << last_dcmd << ","
             << (ekf_pos_err.empty() ? 0.0 : ekf_pos_err.back()) << "," << (ekf_hdg_err.empty() ? 0.0 : ekf_hdg_err.back())
-            << "," << xs(rl::GYRO_BIAS) << "," << xs(rl::YAW_BIAS) << "\n";
+            << "," << xs(rl::GYRO_BIAS) << "," << xs(rl::YAW_BIAS) << "," << slide_now << "," << ctrl.grip() << ","
+            << mu_now << "," << ay_true << "\n";
       }
     }
   }
@@ -516,8 +596,8 @@ int main(int argc, char** argv) {
   // one machine-readable line: key=value
   std::printf("laps=%.2f time=%.1f elat_rms=%.4f elat_max=%.4f elat_st=%.4f elat_st_mean=%.4f elat_cu=%.4f "
               "steer_std_st=%.4f ekf_err=%.4f ekf_err_max=%.4f ekf_hdg=%.4f jump_max=%.4f rejected=%d resets=%d "
-              "aborts=%d\n",
+              "aborts=%d beta_max=%.4f\n",
               s_trav / truth.length(), t, rms(el), absmax(el), rms(el_st), mean(el_st), rms(el_cu), stdv(d_st),
-              mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts);
+              mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max);
   return 0;
 }
