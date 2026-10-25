@@ -15,6 +15,7 @@ TrackingMpc::TrackingMpc(const ModelParams& m, const MpcSettings& s) : mod_(m), 
   xn_.resize(N_ + 1);
   sn_.resize(N_ + 1);
   kn_.resize(N_ + 1);
+  dn_.assign(N_ + 1, 0.0);
   S_.assign(N_ + 1, Eigen::Matrix<double, 4, Eigen::Dynamic>::Zero(4, n_));
   P_.resize(n_, n_);
   q_.resize(n_);
@@ -32,7 +33,7 @@ TrackingMpc::TrackingMpc(const ModelParams& m, const MpcSettings& s) : mod_(m), 
 }
 
 Eigen::Vector4d TrackingMpc::step(const Eigen::Vector4d& x, double v_cmd, double d_cmd, double kappa,
-                                  double& ds) const {
+                                  double& ds, double yaw_dist) const {
   const int M = std::max(1, set_.substeps);
   const double h = set_.dt / M;
   const double av = std::exp(-h / mod_.speed_tau), ad = std::exp(-h / mod_.steer_tau);
@@ -43,7 +44,7 @@ Eigen::Vector4d TrackingMpc::step(const Eigen::Vector4d& x, double v_cmd, double
     // actuators exactly (piecewise-constant input), kinematics by the midpoint rule
     const double v1 = vt + (s[2] - vt) * av, d1 = d_cmd + (s[3] - d_cmd) * ad;
     const double vm = 0.5 * (s[2] + v1), dm = 0.5 * (s[3] + d1);
-    const double r = vm * std::tan(dm) / (L * (1.0 + mod_.understeer * vm * vm));
+    const double r = vm * std::tan(dm) / (L * (1.0 + mod_.understeer * vm * vm)) + yaw_dist;
     auto f = [&](double ey, double ep, double& dey, double& dep, double& dsd) {
       const double den = std::max(1.0 - kappa * ey, 0.1);
       dsd = (vm * std::cos(ep) - a * r * std::sin(ep)) / den;
@@ -68,9 +69,10 @@ void TrackingMpc::rollout(const Eigen::Vector4d& x0, double s0, const PathGeomet
   const int nd = set_.speed_delay_steps;
   for (int k = 0; k < N_; ++k) {
     kn_[k] = path.kappa_at(sn_[k]);
+    dn_[k] = yaw_dist_ ? yaw_dist_(sn_[k]) : 0.0;
     const double vc = (k - nd >= 0) ? u_nom_[2 * (k - nd)] : v_prev;
     double ds = 0.0;
-    xn_[k + 1] = step(xn_[k], vc, u_nom_[2 * k + 1], kn_[k], ds);
+    xn_[k + 1] = step(xn_[k], vc, u_nom_[2 * k + 1], kn_[k], ds, dn_[k]);
     sn_[k + 1] = sn_[k] + ds;
   }
   kn_[N_] = path.kappa_at(sn_[N_]);
@@ -135,14 +137,16 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
         xp[j] += ex;
         xm[j] -= ex;
         double d1 = 0.0, d2 = 0.0;
-        Ak.col(j) = (step(xp, vc, dc, kn_[k], d1) - step(xm, vc, dc, kn_[k], d2)) / (2.0 * ex);
+        Ak.col(j) = (step(xp, vc, dc, kn_[k], d1, dn_[k]) - step(xm, vc, dc, kn_[k], d2, dn_[k])) / (2.0 * ex);
       }
       double d1 = 0.0, d2 = 0.0;
-      const Eigen::Vector4d Bd = (step(xn_[k], vc, dc + ex, kn_[k], d1) - step(xn_[k], vc, dc - ex, kn_[k], d2)) / (2.0 * ex);
+      const Eigen::Vector4d Bd =
+          (step(xn_[k], vc, dc + ex, kn_[k], d1, dn_[k]) - step(xn_[k], vc, dc - ex, kn_[k], d2, dn_[k])) / (2.0 * ex);
       S_[k + 1].noalias() = Ak * S_[k];
       S_[k + 1].col(2 * k + 1) += Bd;
       if (k - nd >= 0) {
-        const Eigen::Vector4d Bv = (step(xn_[k], vc + ex, dc, kn_[k], d1) - step(xn_[k], vc - ex, dc, kn_[k], d2)) / (2.0 * ex);
+        const Eigen::Vector4d Bv =
+            (step(xn_[k], vc + ex, dc, kn_[k], d1, dn_[k]) - step(xn_[k], vc - ex, dc, kn_[k], d2, dn_[k])) / (2.0 * ex);
         S_[k + 1].col(2 * (k - nd)) += Bv;
       }
     }
@@ -256,6 +260,12 @@ TrackingController::TrackingController(const ControllerParams& p)
 void TrackingController::set_path(const std::vector<double>& x, const std::vector<double>& y) {
   path_ = std::make_unique<PathGeometry>(x, y);
   mpc_.reset();
+  yaw_map_.clear();
+  last_s_ = -1.0;
+  if (p_.yaw_map_bin > 0.0) {
+    yaw_map_.assign(static_cast<size_t>(path_->length() / p_.yaw_map_bin) + 1, 0.0);
+    mpc_.set_yaw_disturbance([this](double s) { return yaw_map_at(s); });
+  }
 }
 
 double TrackingController::steer_to_eff(double d) const {
@@ -332,6 +342,13 @@ bool TrackingController::imu_mean(double t0, double t1, double& r) const {
   return true;
 }
 
+double TrackingController::yaw_map_at(double s) const {
+  if (yaw_map_.empty()) return 0.0;
+  const double len = path_->length();
+  s = path_->closed() ? std::fmod(std::fmod(s, len) + len, len) : std::clamp(s, 0.0, len);
+  return yaw_map_[std::min(yaw_map_.size() - 1, static_cast<size_t>(s / p_.yaw_map_bin))];
+}
+
 double TrackingController::yaw_rate_of(double v, double delta) const {
   return v * std::tan(delta) / (p_.model.wheelbase * (1.0 + understeer_ * v * v));
 }
@@ -371,14 +388,13 @@ void TrackingController::detect_slip(double t, double r) {
 }
 
 void TrackingController::update_grip(double t_arr) {
-  if ((!p_.grip_adaptation && p_.understeer_tau <= 0.0) || vel_.empty()) return;
+  if ((!p_.grip_adaptation && p_.understeer_tau <= 0.0 && yaw_map_.empty()) || vel_.empty()) return;
   const double dt = last_grip_t_ < 0.0 ? 0.0 : std::min(t_arr - last_grip_t_, 0.5);
   last_grip_t_ = t_arr;
   if (p_.grip_adaptation) {
     const double g = p_.grip_margin * grip_ * 9.81;
     mpc_.set_grip_limits(std::min(p_.mpc.a_lat_max, g), std::min(p_.mpc.v_rate_max, g * p_.mpc.drive_axle_load), g);
   }
-  if (p_.understeer_tau <= 0.0) return;
   const double t1 = t_arr - 0.05, t0 = t1 - 0.1, tm = 0.5 * (t0 + t1);
   double r = 0.0;
   if (!imu_mean(t0, t1, r)) return;
@@ -389,6 +405,14 @@ void TrackingController::update_grip(double t_arr) {
   // too), and not on a floor already found slippery (a wet floor's plowing is no understeer)
   const bool slip = slip_time_ > 0.0 || grip_ < 0.9 * p_.grip_nominal ||
                     std::fabs(r_model - r) > p_.slip_rel * std::fabs(r_model) + p_.slip_abs + 0.1;
+  if (!yaw_map_.empty() && last_s_ >= 0.0 && v > 0.5 && slip_time_ == 0.0 && grip_ >= 0.9 * p_.grip_nominal) {
+    // last_s_ is the arc length of the previous control step (t_arr - 0.1 ~ tm)
+    const double len = path_->length();
+    const double s = path_->closed() ? std::fmod(std::fmod(last_s_, len) + len, len) : std::clamp(last_s_, 0.0, len);
+    double& b = yaw_map_[std::min(yaw_map_.size() - 1, static_cast<size_t>(s / p_.yaw_map_bin))];
+    b = std::clamp(b + p_.yaw_map_gain * ((r - r_model) - b), -p_.yaw_map_max, p_.yaw_map_max);
+  }
+  if (p_.understeer_tau <= 0.0) return;
   if (!slip && v > 1.2 && std::fabs(r) > 0.3 && std::fabs(std::tan(delta)) > 0.05 && r * delta > 0.0) {
     // r = v tan(d) / (L (1 + k v^2))  ->  k = (v tan(d) / (L r) - 1) / v^2
     const double k = (v * std::tan(delta) / (p_.model.wheelbase * r) - 1.0) / (v * v);
@@ -479,6 +503,7 @@ ControlOutput TrackingController::on_pose(double t_arr, double px, double py, do
   const Projection pr = path.project(rx + a * std::cos(psi), ry + a * std::sin(psi), psi);
   o.x0 << pr.e_lat, pr.e_psi, v_arr + speed_.value_at(t_start) - vm_arr, delta_at(t_start);
   o.s0 = pr.s;
+  last_s_ = pr.s;
   o.t_start = t_start;
   // back to the measured point for the next local projection
   path.project(px, py, yaw);

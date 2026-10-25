@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BIN = os.path.join(HERE, '..', '..', 'build', 'stack_sim', 'stack_sim')
 COLUMNS = ['elat_rms', 'elat_max', 'elat_st', 'elat_st_mean', 'elat_cu', 'steer_std_st', 'ekf_err', 'ekf_err_max',
-           'ekf_hdg', 'jump_max', 'rejected', 'resets', 'aborts', 'beta_max', 'laps', 'time']
+           'ekf_hdg', 'jump_max', 'rejected', 'resets', 'aborts', 'beta_max', 'elat_lap1', 'elat_last', 'laps', 'time']
 
 
 def run(binary, path, args):

@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
       {"mpc.grip", &grip_on}, {"mpc.grip_margin", &cp.grip_margin}, {"mpc.grip_recover_tau", &cp.grip_recover_tau},
       {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.grip_probe_tau", &cp.grip_probe_tau}, {"mpc.grip_probe_level", &cp.grip_probe_level},
-      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.understeer", &cp.model.understeer}, {"mpc.understeer_tau", &cp.understeer_tau},
+      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.understeer", &cp.model.understeer}, {"mpc.yaw_map_bin", &cp.yaw_map_bin}, {"mpc.yaw_map_gain", &cp.yaw_map_gain}, {"mpc.understeer_tau", &cp.understeer_tau},
       {"tyre_cs", &tyre_cs}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
   };
   for (auto it = kv.begin(); it != kv.end();) {
@@ -308,6 +308,7 @@ int main(int argc, char** argv) {
 
   // metrics
   std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps;
+  std::vector<std::vector<double>> el_lap;  // per lap (learning over laps)
   double last_out_x = NAN, last_out_y = NAN, last_out_t = 0.0;
   int aborts = 0;
   double last_dcmd = 0.0, s_trav = 0.0;
@@ -557,6 +558,9 @@ int main(int argc, char** argv) {
         double kmax = 0.0;
         for (double q = -0.5; q <= 0.5; q += 0.1) kmax = std::max(kmax, std::fabs(truth.kappa_at(tp.s + q)));
         el.push_back(tp.e_lat);
+        const size_t lap = static_cast<size_t>(std::max(0.0, s_trav) / truth.length());
+        if (el_lap.size() <= lap) el_lap.resize(lap + 1);
+        el_lap[lap].push_back(tp.e_lat);
         if (kmax < 0.15) {
           el_st.push_back(tp.e_lat);
           d_st.push_back(last_dcmd);
@@ -597,8 +601,9 @@ int main(int argc, char** argv) {
   // one machine-readable line: key=value
   std::printf("laps=%.2f time=%.1f elat_rms=%.4f elat_max=%.4f elat_st=%.4f elat_st_mean=%.4f elat_cu=%.4f "
               "steer_std_st=%.4f ekf_err=%.4f ekf_err_max=%.4f ekf_hdg=%.4f jump_max=%.4f rejected=%d resets=%d "
-              "aborts=%d beta_max=%.4f\n",
+              "aborts=%d beta_max=%.4f elat_lap1=%.4f elat_last=%.4f\n",
               s_trav / truth.length(), t, rms(el), absmax(el), rms(el_st), mean(el_st), rms(el_cu), stdv(d_st),
-              mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max);
+              mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max, el_lap.size() > 1 ? rms(el_lap[1]) : NAN,
+              el_lap.size() > 1 ? rms(el_lap[el_lap.size() - (el_lap.back().size() < el_lap[1].size() / 2 ? 2 : 1)]) : NAN);
   return 0;
 }

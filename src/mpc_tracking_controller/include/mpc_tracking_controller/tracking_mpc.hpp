@@ -22,6 +22,7 @@
 
 #include <Eigen/Dense>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -80,10 +81,14 @@ class TrackingMpc {
                   double d_prev);
   void reset() { have_nominal_ = false; }
   // one stage of the model; returns x_next, adds the travelled arc length to ds
-  Eigen::Vector4d step(const Eigen::Vector4d& x, double v_cmd, double d_cmd, double kappa, double& ds) const;
+  // yaw_dist: yaw-rate disturbance [rad/s] added to the model (learned along the path)
+  Eigen::Vector4d step(const Eigen::Vector4d& x, double v_cmd, double d_cmd, double kappa, double& ds,
+                       double yaw_dist = 0.0) const;
   const MpcSettings& settings() const { return set_; }
   // limits that change at run time (grip adaptation); the configured ones are the upper bounds
   void set_understeer(double k) { mod_.understeer = k; }
+  // yaw-rate disturbance along the path (arc length -> rad/s); empty = none
+  void set_yaw_disturbance(std::function<double(double)> d) { yaw_dist_ = std::move(d); }
   void set_grip_limits(double a_lat_max, double v_rate_max, double grip_accel) {
     set_.a_lat_max = a_lat_max;
     set_.v_rate_max = v_rate_max;
@@ -94,12 +99,13 @@ class TrackingMpc {
   void rollout(const Eigen::Vector4d& x0, double s0, const PathGeometry& path, double v_prev);
   ModelParams mod_;
   MpcSettings set_;
+  std::function<double(double)> yaw_dist_;
   DenseQp qp_;
   int N_, n_, m_;
   Eigen::VectorXd u_nom_;                // [v_0, d_0, v_1, d_1, ...]
   bool have_nominal_ = false;
   std::vector<Eigen::Vector4d> xn_;      // nominal states
-  std::vector<double> sn_, kn_;          // nominal arc length, curvature per stage
+  std::vector<double> sn_, kn_, dn_;     // nominal arc length, curvature, yaw disturbance per stage
   Eigen::MatrixXd P_, A_;
   Eigen::VectorXd q_, l_, u_;
   std::vector<Eigen::Matrix<double, 4, Eigen::Dynamic>> S_;
@@ -174,6 +180,13 @@ struct ControllerParams {
   // the tyres' normal (linear) understeer is not taken for a slide.
   double understeer_tau = 0.0;
   double understeer_max = 0.3;    // s^2/m^2
+  // Yaw-rate residual map along the path (Pi-MPC idea, in arc length instead of time): the part of
+  // the IMU yaw rate the model does not explain is learned per yaw_map_bin [m] (0 = off) while the
+  // car grips, blended with yaw_map_gain per pass, and fed to the MPC model: whatever repeats lap
+  // after lap (tyres, map, trim, the floor) is predicted instead of corrected after the fact.
+  double yaw_map_bin = 0.0;
+  double yaw_map_gain = 0.3;
+  double yaw_map_max = 1.0;       // rad/s
 };
 
 enum class Status { kOk, kNoPath, kNoSpeed, kAbort };
@@ -223,7 +236,9 @@ class TrackingController {
   // mean IMU yaw rate over [t0, t1]; false if too few samples
   bool imu_mean(double t0, double t1, double& r) const;
   double grip_ = 1.0, last_grip_t_ = -1.0, grip_before_ = 1.0, episode_max_ = 0.0;
-  double understeer_ = 0.0;
+  double understeer_ = 0.0, last_s_ = -1.0;
+  std::vector<double> yaw_map_;
+  double yaw_map_at(double s) const;
   double rf_ = 0.0, rmf_ = 0.0, last_imu_t_ = -1.0, slip_time_ = 0.0;
   bool slipping_ = false;
   void detect_slip(double t, double r);

@@ -95,6 +95,9 @@ class MpcNode : public rclcpp::Node {
     p.model.understeer = D("model.understeer", p.model.understeer);
     p.understeer_tau = D("understeer.tau", p.understeer_tau);
     p.understeer_max = D("understeer.max", p.understeer_max);
+    p.yaw_map_bin = D("yaw_map.bin", p.yaw_map_bin);
+    p.yaw_map_gain = D("yaw_map.gain", p.yaw_map_gain);
+    p.yaw_map_max = D("yaw_map.max", p.yaw_map_max);
     p.steer_offset_max = D("steer_offset.max", p.steer_offset_max);
     p.steer_offset_min_speed = D("steer_offset.min_speed", p.steer_offset_min_speed);
     p.steer_offset_max_delta = D("steer_offset.max_delta", p.steer_offset_max_delta);

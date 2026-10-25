@@ -73,6 +73,13 @@
     understeer:
       tau: 0.0                 # s
       max: 0.3                 # s^2/m^2
+    # Yaw-rate residual along the path (Pi-MPC, Pabon et al. 2024, in arc length): what the model
+    # misses at each place is learned while gripping and predicted on the next laps; 0 = off.
+    # stack_sim dynamic plant 3 m/s, 8 laps: last lap 11.2 -> 9.2 cm (8.6 with understeer learning).
+    yaw_map:
+      bin: 0.0                 # m, e.g. 0.25
+      gain: 0.3                # blend per pass
+      max: 1.0                 # rad/s
 
     model:
       wheelbase: 0.28          # m, in pose units (servo_per_rad calibrated for L = 0.28)
