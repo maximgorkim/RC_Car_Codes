@@ -8,6 +8,11 @@ the 0.0 beams as points at the sensor in parts of the scan matching: on a
 synthetic bag with ground truth the map fell apart (mean error 6.5 m, 1 m/s);
 with the zeros as +inf it is 29 cm (odometry alone 52 cm).
 
+stamp_shift [s] (default 0) moves the stamp: the driver stamps the scan's first
+beam while the beams spread over the scan (0.1 s at 10 Hz); slam_toolbox takes the
+stamp as the time of the whole scan, so at 2.5 m/s its pose falls ~12 cm behind
+along the track (synthetic bag). scan_time / 2 puts the stamp mid-scan.
+
 The particle filter keeps the raw /scan (range_libc does not take +inf), so the
 driver setting stays as it is and only slam_toolbox gets this topic.
 
@@ -33,6 +38,7 @@ class ScanForSlam(Node):
         super().__init__('scan_for_slam')
         in_topic = self.declare_parameter('in_topic', '/scan').value
         out_topic = self.declare_parameter('out_topic', '/scan_slam').value
+        self.shift_ns = int(round(1e9 * self.declare_parameter('stamp_shift', 0.0).value))
         self.pub = self.create_publisher(LaserScan, out_topic, qos_profile_sensor_data)
         self.create_subscription(LaserScan, in_topic, self.on_scan, qos_profile_sensor_data)
         self.get_logger().info(f'{in_topic} -> {out_topic} (beams below range_min as +inf)')
@@ -40,6 +46,9 @@ class ScanForSlam(Node):
     def on_scan(self, msg):
         lo = msg.range_min
         msg.ranges = [r if r >= lo else math.inf for r in msg.ranges]  # NaN fails r >= lo too
+        if self.shift_ns:
+            ns = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec + self.shift_ns
+            msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(ns, 1000000000)
         self.pub.publish(msg)
 
 

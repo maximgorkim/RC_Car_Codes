@@ -1,7 +1,7 @@
 #!/bin/bash
 # slam_run.sh BAG OUTDIR [SLAM_PARAMS]: the car's mapping chain on a synthetic bag (make_bag.py), against the truth.
 #   twist_estimator + EKF (no PF: dead reckoning, TF odom->base_link) + scan_for_slam + slam_toolbox (sync)
-#   -> OUTDIR/log.npy (slam map->base_link next to /truth/odom), OUTDIR/map.{pgm,yaml}; then slam_eval.py OUTDIR
+#   -> OUTDIR/log.npy (slam map->base_link next to /truth/odom), OUTDIR/map.{pgm,yaml,posegraph,data}; then slam_eval.py OUTDIR
 # Env: DOM (ROS_DOMAIN_ID, parallel runs need different ones), SLAMEXE (async_slam_toolbox_node), RATE.
 source /opt/ros/humble/setup.bash; source ~/RC_Car_Codes/install/setup.bash
 B=$1; O=$2; P=${3:-~/RC_Car_Codes/src/rc_localization/config/slam_mapping.yaml}
@@ -21,6 +21,7 @@ PP=$!
 sleep 0.5; ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped '{header: {frame_id: odom}}' > /dev/null 2>&1
 wait $PP; sleep 2
 ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "{name: {data: '$O/map'}}" > /dev/null 2>&1
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph "{filename: '$O/map'}" > /dev/null 2>&1
 kill -INT $LP; sleep 1
 for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 wait
