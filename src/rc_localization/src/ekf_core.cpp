@@ -55,7 +55,8 @@ void Ekf::predict_step(double dt)
   x(YAW) = normalize_angle(x(YAW) + w * dt);
 
   StateVec q;
-  q << p_.q_pos, p_.q_pos, p_.q_yaw, p_.q_yaw_bias, p_.q_vx, p_.q_wz, p_.q_gyro_bias, p_.q_speed_scale, 0.0, 0.0, 0.0;
+  q << p_.q_pos, p_.q_pos, p_.q_yaw, p_.q_yaw_bias, p_.q_vx, p_.q_wz, p_.q_gyro_bias, p_.q_speed_scale, 0.0, 0.0, 0.0,
+    p_.q_vo_scale;
 
   if (p_.lateral_dynamics) {
     const double vy = x(VY), ay = x(AY), k = 1.0 / p_.slip_tau;
@@ -170,6 +171,37 @@ bool Ekf::update_accel(const AccelMeas & m, double * d2)
   return true;
 }
 
+bool Ekf::update_vo(const VoMeas & m, double * d2)
+{
+  const double s = x(VO_SCALE), v = x(VX), w = x(WZ), l = p_.vo_lever;
+  const double vl = lateral_velocity();
+  Eigen::Matrix<double, 2, NX> H = Eigen::Matrix<double, 2, NX>::Zero();
+  H(0, VX) = s;
+  H(0, VO_SCALE) = v;
+  H(1, VO_SCALE) = vl + l * w;
+  if (p_.lateral_dynamics) {
+    H(1, VY) = s;
+    H(1, WZ) = s * l;
+  } else {
+    H(1, WZ) = s * (p_.lever_arm + l);
+  }
+  const Eigen::Vector2d h(s * v, s * (vl + l * w));
+  const Eigen::Vector2d y = m.z - h;
+
+  const Eigen::Matrix2d S = H * P * H.transpose() + m.R;
+  const Eigen::Matrix2d S_inv = S.inverse();
+  const double maha = y.dot(S_inv * y);
+  if (d2) *d2 = maha;
+  if (p_.vo_gate > 0.0 && maha > p_.vo_gate) return false;
+
+  const Eigen::Matrix<double, NX, 2> K = P * H.transpose() * S_inv;
+  x += K * y;
+  const StateMat I_KH = StateMat::Identity() - K * H;
+  P = I_KH * P * I_KH.transpose() + K * m.R * K.transpose();
+  finish_update();
+  return true;
+}
+
 void Ekf::finish_update()
 {
   x(YAW) = normalize_angle(x(YAW));
@@ -177,6 +209,7 @@ void Ekf::finish_update()
   x(GYRO_BIAS) = std::clamp(x(GYRO_BIAS), -p_.max_gyro_bias, p_.max_gyro_bias);
   x(SPEED_SCALE) = std::clamp(x(SPEED_SCALE), p_.min_speed_scale, p_.max_speed_scale);
   x(AY_BIAS) = std::clamp(x(AY_BIAS), -p_.max_ay_bias, p_.max_ay_bias);
+  x(VO_SCALE) = std::clamp(x(VO_SCALE), p_.min_vo_scale, p_.max_vo_scale);
   P = 0.5 * (P + P.transpose());
 }
 
@@ -206,6 +239,9 @@ void DelayedEkf::process(Entry & e, double t_prev)
       break;
     case Measurement::Type::ACCEL:
       e.accepted = ekf_.update_accel(e.m.accel, &e.d2);
+      break;
+    case Measurement::Type::VO:
+      e.accepted = ekf_.update_vo(e.m.vo, &e.d2);
       break;
     case Measurement::Type::INIT:
       break;

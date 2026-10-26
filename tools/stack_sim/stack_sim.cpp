@@ -29,6 +29,9 @@
 //   pf_pos_extra=0.04          s the PF position is older than its heading (car_like.json; the
 //                              2026-10-05 bags fit 0 better, see ekf_replay pose_position_delay)
 //   accel_bias=0.0             m/s^2 IMU lateral accel offset (mounting tilt; the car: -0.30)
+//   ekf.vo=0                   ZED visual odometry velocity to the EKF (1 = on); the VO poses: 30 Hz,
+//   vo_scale=1.044 vo_noise=0.015 vo_latency=0.041   scale vs truth, white position noise [m] (bags:
+//                              0.1-0.17 m/s over 0.2 s), arrival after the stamp [s]
 //   glitch_rate=0 glitch_m=0.5 per-pose probability and size of a PF position jump
 //   lost_t=-1 lost_dur=3 lost_rate=0.5  PF loses track at lost_t: pose slides back at lost_rate m/s
 //   + any EKF / MPC parameter listed in apply_key() below
@@ -49,6 +52,7 @@
 
 #include "mpc_tracking_controller/tracking_mpc.hpp"
 #include "rc_localization/ekf_core.hpp"
+#include "rc_localization/vo_velocity.hpp"
 
 namespace rl = rc_localization;
 using mpc_tc::ControllerParams;
@@ -191,6 +195,8 @@ int main(int argc, char** argv) {
   double erpm_per_mps = 2080.0, speed_stddev = 0.1, yaw_rate_stddev = 0.02, standstill_erpm = 50.0;
   double init_yaw_bias = 0.05, max_extrapolation = 0.1, history = 1.0, output_rate = 50.0;
   double lateral_dynamics = 0.0, accel_stddev = 1.0, init_ay_bias = 0.0, accel_bias = 0.0;
+  double vo_on = 0.0, vo_scale_true = 1.044, vo_noise = 0.015, vo_latency = 0.041, vo_stddev = 0.15;
+  double init_vo_scale = 1.04, vo_window = 0.2, vo_period = 0.1;
   int max_rejections = 15;
   // ------------------------------------------------------------------ MPC (mpc_car.yaml values)
   ControllerParams cp;
@@ -209,6 +215,10 @@ int main(int argc, char** argv) {
       {"ekf.lateral_dynamics", &lateral_dynamics}, {"ekf.slip_tau", &ep.slip_tau}, {"ekf.q_vy", &ep.q_vy},
       {"ekf.q_ay", &ep.q_ay}, {"ekf.q_ay_bias", &ep.q_ay_bias}, {"ekf.accel_stddev", &accel_stddev},
       {"ekf.init_ay_bias", &init_ay_bias}, {"accel_bias", &accel_bias},
+      {"ekf.vo", &vo_on}, {"ekf.vo_stddev", &vo_stddev}, {"ekf.init_vo_scale", &init_vo_scale},
+      {"ekf.vo_window", &vo_window}, {"ekf.vo_period", &vo_period}, {"ekf.vo_gate", &ep.vo_gate},
+      {"ekf.q_vo_scale", &ep.q_vo_scale}, {"vo_scale", &vo_scale_true}, {"vo_noise", &vo_noise},
+      {"vo_latency", &vo_latency},
       {"mpc.v_max", &cp.mpc.v_max}, {"mpc.a_lat_max", &cp.mpc.a_lat_max}, {"mpc.max_e_lat", &cp.mpc.max_e_lat},
       {"mpc.max_e_psi", &cp.mpc.max_e_psi}, {"mpc.control_period", &cp.control_period},
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
@@ -251,7 +261,8 @@ int main(int argc, char** argv) {
   rl::DelayedEkf ekf(ep, history);
 
   // one stream per noise source: a scenario that adds a source leaves the others unchanged
-  std::mt19937 rng(seed), rng_imu(seed + 1000), rng_pose(seed + 2000), rng_glitch(seed + 3000), rng_bias(seed + 4000);
+  std::mt19937 rng(seed), rng_imu(seed + 1000), rng_pose(seed + 2000), rng_glitch(seed + 3000), rng_bias(seed + 4000),
+      rng_vo(seed + 5000);
   std::normal_distribution<double> N01(0.0, 1.0);
   std::uniform_real_distribution<double> U01(0.0, 1.0);
 
@@ -269,7 +280,7 @@ int main(int argc, char** argv) {
       if (it->t <= tq) return *it;
     return hist.front();
   };
-  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0, ay_bl = 0.0;
+  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0, ay_bl = 0.0, vlat_true = 0.0;
   // dynamic plant: body velocities at the centre of gravity. Tyre data: F1TENTH single-track model
   // (C_alpha = C_S mu F_z, C_Sf 4.718, C_Sr 5.456 1/rad), scaled to this wheelbase. Mildly
   // understeering (~0.03 rad/g), i.e. kinematic at the bags' 0.1-0.3 g, as identified.
@@ -295,7 +306,8 @@ int main(int argc, char** argv) {
   // twist_estimator state
   double te_speed = 0.0, te_vesc_stamp = -1.0;
   // ekf_localizer state
-  int consecutive_rej = 0, total_rej = 0, resets = 0;
+  int consecutive_rej = 0, total_rej = 0, resets = 0, vo_rej = 0;
+  rl::VoVelocity vo_diff(vo_window, vo_period);
   auto ekf_init = [&](double t, double mx, double my, double myaw) {
     rl::StateVec x0 = rl::StateVec::Zero();
     x0(rl::X) = mx;
@@ -304,17 +316,19 @@ int main(int argc, char** argv) {
     x0(rl::YAW_BIAS) = init_yaw_bias;
     x0(rl::SPEED_SCALE) = 1.0;
     x0(rl::AY_BIAS) = init_ay_bias;
+    x0(rl::VO_SCALE) = init_vo_scale;
     if (ekf.initialized()) {
-      for (int i : {rl::YAW_BIAS, rl::GYRO_BIAS, rl::SPEED_SCALE, rl::AY_BIAS, rl::VX, rl::WZ}) x0(i) = ekf.state()(i);
+      for (int i : {rl::YAW_BIAS, rl::GYRO_BIAS, rl::SPEED_SCALE, rl::AY_BIAS, rl::VX, rl::WZ, rl::VO_SCALE})
+        x0(i) = ekf.state()(i);
     }
     rl::StateVec sd;
-    sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5;
+    sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5, 0.05;
     ekf.initialize(t, x0, sd.array().square().matrix().asDiagonal());
     consecutive_rej = 0;
   };
 
   // metrics
-  std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps, ekf_err_slide;
+  std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps, ekf_err_slide, vlat_err_slide;
   std::vector<std::vector<double>> el_lap;  // per lap (learning over laps)
   double last_out_x = NAN, last_out_y = NAN, last_out_t = 0.0, ser_ekf_err = 0.0, ser_ekf_hdg = 0.0;
   int aborts = 0;
@@ -359,7 +373,7 @@ int main(int argc, char** argv) {
   };
 
   const double h = 0.001;
-  double t = 0.0, next_imu = 0.0, next_vesc = 0.0, next_pose = 0.5, next_out = 0.5, next_metric = 0.0;
+  double t = 0.0, next_imu = 0.0, next_vesc = 0.0, next_vo = 0.0, next_pose = 0.5, next_out = 0.5, next_metric = 0.0;
   double last_s = truth.project(x + A * std::cos(psi), y + A * std::sin(psi), psi).s;
   double lost_offset = 0.0;
   while (t < t_end && s_trav < laps * truth.length() && !stopped) {
@@ -423,6 +437,7 @@ int main(int argc, char** argv) {
     }
     // lateral acceleration at base_link (where the EKF's lateral model sits)
     const double rdot = (r - r_now) / h;
+    vlat_true = dyn ? dvy + (A - lr) * r : A * r;
     ay_bl = ay_true + (A - (dyn ? lr : 0.0)) * rdot;
     r_now = r;
     t += h;
@@ -462,6 +477,24 @@ int main(int argc, char** argv) {
                           .asDiagonal();
           ekf.add(m);
         });
+      });
+    }
+    if (vo_on != 0.0 && t >= next_vo) {
+      // ZED: pose of the camera (at base_link, car axis), its own scale, white noise; stamped now
+      next_vo += 1.0 / 30.0;
+      const double cx = vo_scale_true * (x + A * std::cos(psi)) + vo_noise * N01(rng_vo);
+      const double cy = vo_scale_true * (y + A * std::sin(psi)) + vo_noise * N01(rng_vo);
+      const double cyaw = psi + 0.002 * N01(rng_vo);
+      const double stamp = t;
+      post(t + vo_latency, [&, stamp, cx, cy, cyaw] {
+        rl::VoVelocity::Out o;
+        if (!vo_diff.add(stamp, cx, cy, cyaw, o) || !ekf.initialized()) return;
+        rl::Measurement m;
+        m.t = o.t;
+        m.type = rl::Measurement::Type::VO;
+        m.vo.z << o.v_fwd, o.v_left;
+        m.vo.R = vo_stddev * vo_stddev * Eigen::Matrix2d::Identity();
+        if (ekf.add(m) == rl::DelayedEkf::Result::REJECTED) ++vo_rej;
       });
     }
     if (t >= next_vesc) {
@@ -553,7 +586,12 @@ int main(int argc, char** argv) {
           ser_ekf_hdg = rl::normalize_angle(xe(rl::YAW) - (psi - heading_bias));
           if (t > 10.0) {
             ekf_pos_err.push_back(std::hypot(ex, ey));
-            if (std::fabs(slide_now) > 0.03) ekf_err_slide.push_back(std::hypot(ex, ey));
+            if (std::fabs(slide_now) > 0.03) {
+              ekf_err_slide.push_back(std::hypot(ex, ey));
+              // side slip: lateral velocity of base_link, estimated vs true (car axis frame)
+              const double vl_est = ep.lateral_dynamics ? xe(rl::VY) : ep.lever_arm * xe(rl::WZ);
+              vlat_err_slide.push_back(vl_est - vlat_true);
+            }
             ekf_hdg_err.push_back(rl::normalize_angle(xe(rl::YAW) - (psi - heading_bias)));
             if (!std::isnan(last_out_x)) {
               // jump: change between outputs beyond what the true motion explains
@@ -636,5 +674,8 @@ int main(int argc, char** argv) {
               mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max, el_lap.size() > 1 ? rms(el_lap[1]) : NAN,
               el_lap.size() > 1 ? rms(el_lap[el_lap.size() - (el_lap.back().size() < el_lap[1].size() / 2 ? 2 : 1)]) : NAN,
               mean(ekf_err_slide), absmax(ekf_err_slide), ekf_err_slide.size());
+  // second line: side slip estimate (vlat_err_slide) and the visual odometry
+  std::printf("vlat_err_slide=%.4f vo_rejected=%d vo_scale_est=%.4f\n", rms(vlat_err_slide), vo_rej,
+                ekf.initialized() ? ekf.state()(rl::VO_SCALE) : NAN);
   return 0;
 }

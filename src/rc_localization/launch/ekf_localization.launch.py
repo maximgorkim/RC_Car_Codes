@@ -38,6 +38,8 @@ def generate_launch_description():
                               description='IMU lateral accel scale: 1.24 car (calibrated), 1.0 Gazebo'),
         DeclareLaunchArgument('ay_bias', default_value='-0.30',
                               description='initial IMU lateral accel bias [m/s^2]: -0.30 car, 0.0 Gazebo'),
+        DeclareLaunchArgument('vo', default_value='false',
+                              description='ZED visual odometry velocity as a measurement (side slip)'),
         DeclareLaunchArgument('monitor', default_value='false',
                               description='also start localization_monitor'),
         DeclareLaunchArgument('csv_path', default_value='',
@@ -63,7 +65,8 @@ def generate_launch_description():
                          'output_trigger': LaunchConfiguration('output_trigger'),
                          'model.lateral_dynamics': LaunchConfiguration('lateral_dynamics'),
                          'accel_scale': LaunchConfiguration('accel_scale'),
-                         'init.ay_bias': LaunchConfiguration('ay_bias')}],
+                         'init.ay_bias': LaunchConfiguration('ay_bias'),
+                         'vo.enabled': LaunchConfiguration('vo')}],
         ),
         Node(
             package='rc_localization',

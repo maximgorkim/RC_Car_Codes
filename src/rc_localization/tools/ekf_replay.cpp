@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "rc_localization/ekf_core.hpp"
+#include "rc_localization/vo_velocity.hpp"
 
 using namespace rc_localization;
 
@@ -37,13 +38,15 @@ int main(int argc, char ** argv)
     {"speed_std", 0.1}, {"yaw_rate_std", 0.02}, {"init_gyro_bias", 0.0}, {"init_speed_scale", 1.0},
     {"history", 1.0}, {"output_rate", 50.0}, {"standstill_erpm", 50.0}, {"max_rejections", 15},
     {"warmup", 5.0}, {"pose_time_std", 0.04}, {"pose_position_delay", 0.0}, {"init_yaw_bias", 0.05},
-    {"lateral", 0.0}, {"accel_std", 1.0}, {"accel_scale", 1.0}, {"init_ay_bias", 0.0}};
+    {"lateral", 0.0}, {"accel_std", 1.0}, {"accel_scale", 1.0}, {"init_ay_bias", 0.0},
+    {"vo", 0.0}, {"vo_std", 0.15}, {"vo_window", 0.2}, {"vo_period", 0.1}, {"init_vo_scale", 1.04}};
   EkfParams p;
   std::map<std::string, double *> pk = {
     {"lever_arm", &p.lever_arm}, {"q_pos", &p.q_pos}, {"q_yaw", &p.q_yaw}, {"q_yaw_bias", &p.q_yaw_bias},
     {"q_vx", &p.q_vx}, {"q_wz", &p.q_wz}, {"q_gyro_bias", &p.q_gyro_bias}, {"q_speed_scale", &p.q_speed_scale},
     {"pose_gate", &p.pose_gate}, {"max_yaw_bias", &p.max_yaw_bias}, {"slip_tau", &p.slip_tau},
-    {"q_vy", &p.q_vy}, {"q_ay", &p.q_ay}, {"q_ay_bias", &p.q_ay_bias}};
+    {"q_vy", &p.q_vy}, {"q_ay", &p.q_ay}, {"q_ay_bias", &p.q_ay_bias}, {"q_vo_scale", &p.q_vo_scale},
+    {"vo_lever", &p.vo_lever}, {"vo_gate", &p.vo_gate}};
   std::string out_path, innov_path;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -66,6 +69,8 @@ int main(int argc, char ** argv)
   if (innov) std::fprintf(innov, "t,recv,along,cross,yaw,v,w,rejected\n");
 
   DelayedEkf ekf(p, k["history"]);
+  VoVelocity vo(k["vo_window"], k["vo_period"]);
+  int n_vo = 0, n_vo_rej = 0;
   double vesc_speed = 0.0, vesc_stamp = -1.0, next_out = 0.0, t_first = -1.0;
   int n_pose = 0, n_rej = 0, consecutive = 0, resets = 0, n_eval = 0;
   double sum_e2 = 0, sum_ey2 = 0, max_e = 0, max_jump = 0, sum_along2 = 0, sum_cross2 = 0;
@@ -130,13 +135,24 @@ int main(int argc, char ** argv)
         a.accel.R = k["accel_std"] * k["accel_std"];
         ekf.add(a);
       }
+    } else if (type == "vo" && k["vo"] > 0.5) {
+      VoVelocity::Out o;
+      if (!vo.add(stamp, v[2], v[3], v[4], o) || !ekf.initialized()) continue;
+      Measurement m;
+      m.t = o.t;
+      m.type = Measurement::Type::VO;
+      m.vo.z << o.v_fwd, o.v_left;
+      m.vo.R = k["vo_std"] * k["vo_std"] * Eigen::Matrix2d::Identity();
+      ++n_vo;
+      if (ekf.add(m) == DelayedEkf::Result::REJECTED) ++n_vo_rej;
     } else if (type == "pose") {
       const double t = stamp - k["pose_stamp_offset"];
       if (!ekf.initialized()) {
         StateVec x0 = StateVec::Zero();
-        x0 << v[2], v[3], v[4], k["init_yaw_bias"], 0, 0, k["init_gyro_bias"], k["init_speed_scale"], 0, 0, k["init_ay_bias"];
+        x0 << v[2], v[3], v[4], k["init_yaw_bias"], 0, 0, k["init_gyro_bias"], k["init_speed_scale"], 0, 0, k["init_ay_bias"],
+          k["init_vo_scale"];
         StateVec sd;
-        sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5;
+        sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5, 0.05;
         ekf.initialize(t, x0, sd.array().square().matrix().asDiagonal());
         next_out = recv;
         continue;
@@ -177,7 +193,7 @@ int main(int argc, char ** argv)
           StateVec x0 = ekf.state();
           x0(X) = v[2]; x0(Y) = v[3]; x0(YAW) = v[4];
           StateVec sd;
-          sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5;
+          sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.05, 0.2, 2.0, 0.5, 0.05;
           ekf.initialize(t, x0, sd.array().square().matrix().asDiagonal());
           consecutive = 0;
           ++resets;
@@ -204,5 +220,6 @@ int main(int argc, char ** argv)
               n_pose, n_rej, resets, 100 * std::sqrt(sum_e2 / n_eval), 100 * std::sqrt(sum_along2 / n_eval),
               100 * std::sqrt(sum_cross2 / n_eval), 100 * max_e, 180 / M_PI * std::sqrt(sum_ey2 / n_eval),
               100 * max_jump, x(GYRO_BIAS), x(SPEED_SCALE), x(YAW_BIAS));
+  if (k["vo"] > 0.5) std::printf("vo %d rejected %d vo_scale %.3f\n", n_vo, n_vo_rej, x(VO_SCALE));
   return 0;
 }

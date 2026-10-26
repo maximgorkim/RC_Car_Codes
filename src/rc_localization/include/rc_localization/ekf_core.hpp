@@ -1,6 +1,6 @@
 // EKF core for the RC car, without any ROS dependency (unit-testable).
 //
-// State (11):
+// State (12):
 //   x, y        [m]     position of base_link in the world frame
 //   yaw         [rad]   heading of base_link (what the LiDAR pose measures)
 //   yaw_bias    [rad]   direction of travel - yaw (slip angle / LiDAR heading
@@ -12,6 +12,7 @@
 //   vy          [m/s]   lateral velocity of base_link   (lateral_dynamics only)
 //   ay          [m/s^2] lateral acceleration            (lateral_dynamics only)
 //   ay_bias     [m/s^2] IMU accel y bias / mounting tilt: ay_meas = ay + ay_bias
+//   vo_scale    [-]     visual odometry scale factor (ZED: ~1.04 vs the wheels) (vo only)
 //
 // Motion model (constant speed / yaw rate). base_link sits lever_arm (a)
 // metres ahead of the rear axle. Its lateral velocity v_lat is
@@ -31,6 +32,9 @@
 //   pose  z = [x, y, yaw]                          LiDAR pose, ~8 Hz, delayed
 //   twist z = [speed_scale * vx, wz + gyro_bias]   VESC + IMU, ~190 Hz
 //   accel z = ay + ay_bias                         IMU accel y, ~190 Hz (lateral_dynamics)
+//   vo    z = vo_scale * [vx, v_lat + vo_lever wz] camera velocity in the car's frame from the
+//            visual odometry poses (ZED), ~10 Hz: measures the side slip directly, independent
+//            of the wheels (most useful with lateral_dynamics, where v_lat is a state)
 //
 // DelayedEkf keeps a short history of (measurement, state after it). A
 // measurement that arrives late is inserted at its own timestamp and every
@@ -46,8 +50,8 @@
 namespace rc_localization
 {
 
-constexpr int NX = 11;
-enum StateIdx { X = 0, Y, YAW, YAW_BIAS, VX, WZ, GYRO_BIAS, SPEED_SCALE, VY, AY, AY_BIAS };
+constexpr int NX = 12;
+enum StateIdx { X = 0, Y, YAW, YAW_BIAS, VX, WZ, GYRO_BIAS, SPEED_SCALE, VY, AY, AY_BIAS, VO_SCALE };
 
 using StateVec = Eigen::Matrix<double, NX, 1>;
 using StateMat = Eigen::Matrix<double, NX, NX>;
@@ -78,6 +82,12 @@ struct EkfParams
   double q_vy = 0.05;           // m/s / sqrt(s), unmodelled lateral velocity (0.2: bag jumps up to 18 cm)
   double q_ay = 30.0;           // m/s^2 / sqrt(s), lateral acceleration changes fast
   double q_ay_bias = 0.01;      // m/s^2 / sqrt(s)
+  double q_vo_scale = 0.001;    // 1 / sqrt(s)
+
+  // Visual odometry velocity: the camera's distance ahead of base_link [m]
+  // (2026-10-19 bags: v_lat_vo = 0.16-0.22 wz, base_link 0.17 ahead of the rear axle -> ~0).
+  double vo_lever = 0.0;
+  double vo_gate = 13.82;        // squared Mahalanobis, chi2(2 dof) 99.9 %; a lost VO jumps
 
   double max_predict_dt = 0.01;  // s, longer predictions are split into steps
   double pose_gate = 16.27;      // squared Mahalanobis, chi2(3 dof) 99.9 %
@@ -88,6 +98,8 @@ struct EkfParams
   double min_speed_scale = 0.7;
   double max_speed_scale = 1.3;
   double max_ay_bias = 2.0;      // m/s^2 (~12 deg of mounting tilt)
+  double min_vo_scale = 0.8;
+  double max_vo_scale = 1.25;
 };
 
 struct PoseMeas
@@ -110,6 +122,12 @@ struct TwistMeas
   Eigen::Matrix2d R = Eigen::Matrix2d::Identity();
 };
 
+struct VoMeas
+{
+  Eigen::Vector2d z = Eigen::Vector2d::Zero();   // camera velocity forward, left [m/s]
+  Eigen::Matrix2d R = Eigen::Matrix2d::Identity();
+};
+
 struct AccelMeas
 {
   double z = 0.0;   // measured lateral acceleration (IMU y, body frame)
@@ -127,6 +145,7 @@ public:
   bool update_pose(const PoseMeas & m, double * d2 = nullptr);
   bool update_twist(const TwistMeas & m, double * d2 = nullptr);
   bool update_accel(const AccelMeas & m, double * d2 = nullptr);
+  bool update_vo(const VoMeas & m, double * d2 = nullptr);
   // Lateral velocity of base_link used by the motion model.
   double lateral_velocity() const;
 
@@ -142,12 +161,13 @@ private:
 
 struct Measurement
 {
-  enum class Type { INIT, POSE, TWIST, ACCEL };
+  enum class Type { INIT, POSE, TWIST, ACCEL, VO };
   double t = 0.0;
   Type type = Type::INIT;
   PoseMeas pose;
   TwistMeas twist;
   AccelMeas accel;
+  VoMeas vo;
 };
 
 class DelayedEkf

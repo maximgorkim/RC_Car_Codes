@@ -7,6 +7,9 @@
 //                      or nav_msgs/Odometry                      (pose_msg_type: odometry, today's /pf/pose/odom)
 //   initialpose_topic  geometry_msgs/PoseWithCovarianceStamped   (RViz "2D Pose Estimate")
 //   imu_topic          sensor_msgs/Imu  linear_acceleration.y    (model.lateral_dynamics only)
+//   vo_topic           nav_msgs/Odometry, visual odometry POSES (ZED); only with vo.enabled (default off). The
+//                      camera velocity from them (vo_velocity.hpp) is a measurement: side slip
+//                      seen independently of the wheels. Best with model.lateral_dynamics.
 // Publishes (at output_rate, predicted to the output time):
 //   odom_topic         nav_msgs/Odometry          drop-in replacement for /pf/pose/odom
 //   pose_out_topic     geometry_msgs/PoseWithCovarianceStamped
@@ -30,6 +33,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "rc_localization/ekf_core.hpp"
+#include "rc_localization/vo_velocity.hpp"
 
 using namespace rc_localization;
 using geometry_msgs::msg::PoseWithCovarianceStamped;
@@ -67,6 +71,8 @@ public:
     const auto odom_topic = declare_parameter<std::string>("odom_topic", "/localization/odom");
     const auto pose_out_topic = declare_parameter<std::string>("pose_out_topic", "/localization/pose_with_cov");
     const auto debug_topic = declare_parameter<std::string>("debug_topic", "/localization/ekf/debug");
+    const auto vo_topic = declare_parameter<std::string>("vo_topic", "/zed2/zed_node/odom");
+    const bool vo_enabled = declare_parameter<bool>("vo.enabled", false);
     world_frame_ = declare_parameter<std::string>("world_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
@@ -121,6 +127,13 @@ public:
     // The IMU's lateral reading divided by this = body lateral acceleration
     // (mounting position / axis; calibrated on bags as ay_meas vs v*wz).
     accel_scale_ = declare_parameter<double>("accel_scale", 1.0);
+    // visual odometry velocity (vo_topic)
+    init_vo_scale_ = declare_parameter<double>("init.vo_scale", 1.0);
+    init_stddev_vo_scale_ = declare_parameter<double>("init.stddev_vo_scale", 0.05);
+    vo_stddev_ = declare_parameter<double>("vo.stddev", 0.15);     // m/s per component (bags: 0.1-0.17)
+    const double vo_window = declare_parameter<double>("vo.window", 0.2);
+    const double vo_period = declare_parameter<double>("vo.period", 0.1);
+    vo_ = std::make_unique<VoVelocity>(vo_window, vo_period);
 
     // ---- model
     EkfParams p;
@@ -145,6 +158,9 @@ public:
     p.q_vy = declare_parameter<double>("process_noise.vy", p.q_vy);
     p.q_ay = declare_parameter<double>("process_noise.ay", p.q_ay);
     p.q_ay_bias = declare_parameter<double>("process_noise.ay_bias", p.q_ay_bias);
+    p.q_vo_scale = declare_parameter<double>("process_noise.vo_scale", p.q_vo_scale);
+    p.vo_lever = declare_parameter<double>("vo.lever", p.vo_lever);
+    p.vo_gate = declare_parameter<double>("gate.vo", p.vo_gate);
     params_ = p;
     ekf_ = std::make_unique<DelayedEkf>(p, history_length);
 
@@ -157,6 +173,10 @@ public:
     if (p.lateral_dynamics) {
       sub_imu_ = create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, rclcpp::SensorDataQoS(), [this](sensor_msgs::msg::Imu::SharedPtr m) { on_imu(*m); });
+    }
+    if (vo_enabled) {
+      sub_vo_ = create_subscription<nav_msgs::msg::Odometry>(
+        vo_topic, rclcpp::SensorDataQoS(), [this](nav_msgs::msg::Odometry::SharedPtr m) { on_vo(*m); });
     }
     sub_twist_ = create_subscription<TwistWithCovarianceStamped>(
       twist_topic, rclcpp::SensorDataQoS(), [this](TwistWithCovarianceStamped::SharedPtr m) { on_twist(*m); });
@@ -204,9 +224,11 @@ private:
     x0(GYRO_BIAS) = init_gyro_bias_;
     x0(SPEED_SCALE) = init_speed_scale_;
     x0(AY_BIAS) = init_ay_bias_;
+    x0(VO_SCALE) = init_vo_scale_;
     // Keep the learned biases across a re-initialisation.
     if (ekf_->initialized()) {
       x0(AY_BIAS) = ekf_->state()(AY_BIAS);
+      x0(VO_SCALE) = ekf_->state()(VO_SCALE);
       x0(YAW_BIAS) = ekf_->state()(YAW_BIAS);
       x0(GYRO_BIAS) = ekf_->state()(GYRO_BIAS);
       x0(SPEED_SCALE) = ekf_->state()(SPEED_SCALE);
@@ -216,7 +238,7 @@ private:
     StateVec sd;
     sd << init_stddev_xy_, init_stddev_xy_, init_stddev_yaw_, init_stddev_yaw_bias_, init_stddev_vx_,
       init_stddev_wz_, init_stddev_gyro_bias_, init_stddev_speed_scale_, init_stddev_vy_, init_stddev_ay_,
-      init_stddev_ay_bias_;
+      init_stddev_ay_bias_, init_stddev_vo_scale_;
     const StateMat P0 = sd.array().square().matrix().asDiagonal();
     ekf_->initialize(t, x0, P0);
     consecutive_rejections_ = 0;
@@ -234,6 +256,24 @@ private:
       }
     }
     return true;
+  }
+
+  void on_vo(const nav_msgs::msg::Odometry & msg)
+  {
+    const auto & p = msg.pose.pose;
+    if (!finite_or_warn({p.position.x, p.position.y, p.orientation.z, p.orientation.w}, "VO pose")) return;
+    const auto & q = p.orientation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    VoVelocity::Out o;
+    if (!vo_->add(to_sec(msg.header.stamp), p.position.x, p.position.y, yaw, o) || !ekf_->initialized()) return;
+    Measurement m;
+    m.t = o.t;
+    m.type = Measurement::Type::VO;
+    m.vo.z << o.v_fwd, o.v_left;
+    m.vo.R = (vo_stddev_ * vo_stddev_) * Eigen::Matrix2d::Identity();
+    double d2 = 0.0;
+    if (ekf_->add(m, &d2) == DelayedEkf::Result::REJECTED) ++vo_rejections_;
+    last_vo_d2_ = d2;
   }
 
   void on_imu(const sensor_msgs::msg::Imu & msg)
@@ -427,6 +467,7 @@ private:
   // [4] gyro_bias [rad/s]  [5] speed_scale  [6] yaw_bias [rad]
   // [7] total rejected poses  [8] resets  [9] pos stddev [m]  [10] yaw stddev [rad]
   // [11] slip velocity vy - lever_arm*wz [m/s] (0 without lateral_dynamics)  [12] ay_bias [m/s^2]
+  // [13] vo_scale  [14] last VO Mahalanobis^2  [15] rejected VO velocities (vo_topic only)
   void publish_debug(double t_now)
   {
     const StateVec & x = ekf_->state();
@@ -435,7 +476,8 @@ private:
     d.data = {t_now - ekf_->time(), last_pose_delay_, last_pose_d2_, static_cast<double>(last_replayed_),
               x(GYRO_BIAS), x(SPEED_SCALE), x(YAW_BIAS), static_cast<double>(total_rejections_),
               static_cast<double>(resets_), std::sqrt(0.5 * (P(X, X) + P(Y, Y))), std::sqrt(P(YAW, YAW)),
-              params_.lateral_dynamics ? x(VY) - params_.lever_arm * x(WZ) : 0.0, x(AY_BIAS)};
+              params_.lateral_dynamics ? x(VY) - params_.lever_arm * x(WZ) : 0.0, x(AY_BIAS), x(VO_SCALE),
+              last_vo_d2_, static_cast<double>(vo_rejections_)};
     pub_debug_->publish(d);
   }
 
@@ -455,6 +497,7 @@ private:
   double init_stddev_gyro_bias_, init_stddev_speed_scale_;
   double init_ay_bias_, init_stddev_vy_, init_stddev_ay_, init_stddev_ay_bias_, accel_stddev_, accel_sign_,
     accel_scale_;
+  double init_vo_scale_, init_stddev_vo_scale_, vo_stddev_;
   EkfParams params_;
 
   // state
@@ -463,6 +506,9 @@ private:
   double last_pose_d2_ = 0.0, last_pose_delay_ = 0.0;
   int last_replayed_ = 0, consecutive_rejections_ = 0, total_rejections_ = 0, resets_ = 0;
   long twist_too_old_ = 0, dropped_non_finite_ = 0;
+  std::unique_ptr<VoVelocity> vo_;
+  double last_vo_d2_ = 0.0;
+  long vo_rejections_ = 0;
 
   // ROS
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_;
@@ -471,6 +517,7 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
   rclcpp::Subscription<TwistWithCovarianceStamped>::SharedPtr sub_twist_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_vo_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_pose_odom_;
   rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr sub_pose_;
   rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr sub_init_;

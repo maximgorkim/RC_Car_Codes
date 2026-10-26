@@ -14,6 +14,17 @@
     odom_topic: /localization/odom   # drop-in replacement for /pf/pose/odom
     pose_out_topic: /localization/pose_with_cov
     debug_topic: /localization/ekf/debug
+    # ZED visual odometry POSES -> camera velocity as a measurement (side slip without the wheels).
+    # vo.enabled false (default) = off; launch vo:=true. Best with model.lateral_dynamics.
+    # 2026-10-19 bags: scale 1.043-1.045 vs the wheels, timing within 15 ms of the gyro,
+    # lateral velocity 0.16-0.22 wz (camera ~ at base_link), noise 0.1-0.17 m/s (0.2 s window).
+    vo_topic: /zed2/zed_node/odom
+    vo:
+      enabled: false
+      stddev: 0.15                   # m/s per component
+      window: 0.2                    # s, pose difference window
+      period: 0.1                    # s between measurements
+      lever: 0.0                     # m, camera ahead of base_link
     # The planners / path use "odom" as the global frame today; keep it until
     # the TF tree is moved to map -> odom -> base_link.
     world_frame: odom
@@ -63,6 +74,8 @@
       gyro_bias: 0.0                 # learned -0.0005..0.002 rad/s
       speed_scale: 1.0               # learned 0.996-1.019 with erpm_per_mps 2050 -> 2080 used
       ay_bias: -0.30                 # m/s^2 after accel_scale (0.0 in Gazebo)
+      vo_scale: 1.04                 # ZED vs wheels on the 2026-10-19 bags
+      stddev_vo_scale: 0.03
       stddev_vy: 0.2
       stddev_ay: 2.0
       stddev_ay_bias: 0.5

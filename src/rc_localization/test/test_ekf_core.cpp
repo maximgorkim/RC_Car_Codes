@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "rc_localization/ekf_core.hpp"
+#include "rc_localization/vo_velocity.hpp"
 
 using namespace rc_localization;
 
@@ -64,7 +65,7 @@ Result run(double delay, bool compensate, bool gate = true, double v_max = 10.0,
   StateVec x0 = StateVec::Zero();
   x0(SPEED_SCALE) = 1.0;
   StateMat P0 = StateMat::Zero();
-  P0.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.1, 0.1, 0.02 * 0.02, 0.15 * 0.15, 0.0, 0.0, 0.0;
+  P0.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.1, 0.1, 0.02 * 0.02, 0.15 * 0.15, 0.0, 0.0, 0.0, 0.0;
   ekf.initialize(0.0, x0, P0);
 
   struct Pending { double arrive; Measurement m; bool outlier; };
@@ -151,7 +152,7 @@ void check_jacobian(bool lateral)
   p.q_pos = p.q_yaw = p.q_yaw_bias = p.q_vx = p.q_wz = p.q_gyro_bias = p.q_speed_scale = 0.0;
   p.q_vy = p.q_ay = p.q_ay_bias = 0.0;
   StateVec x0;
-  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2;
+  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2, 1.04;
   const double dt = 0.01, eps = 1e-6;
 
   // With Q = 0 and P = I, one step gives P' = F F^T with the analytic F.
@@ -184,7 +185,7 @@ void check_position_delay(bool lateral)
   p.lateral_dynamics = lateral;
   p.pose_gate = 0.0;
   StateVec x0;
-  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2;
+  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2, 1.04;
   const double d = 0.04;
   auto h = [&](const StateVec & x) {
     const double th = x(YAW) + x(YAW_BIAS);
@@ -221,6 +222,105 @@ void check_position_delay(bool lateral)
     }
     EXPECT_LT((H_row - H_num).cwiseAbs().maxCoeff(), 1e-3) << "row " << i;
   }
+}
+
+// Visual odometry velocity: h = vo_scale [vx, v_lat + vo_lever wz]; Jacobian checked as above.
+void check_vo(bool lateral)
+{
+  EkfParams p;
+  p.lateral_dynamics = lateral;
+  p.vo_gate = 0.0;
+  p.vo_lever = 0.1;
+  StateVec x0;
+  x0 << 1.0, -2.0, 0.7, 0.05, 6.0, 0.8, 0.01, 1.05, 0.4, 3.0, 0.2, 1.04;
+  auto h = [&](const StateVec & x) {
+    const double vl = lateral ? x(VY) : p.lever_arm * x(WZ);
+    return Eigen::Vector2d(x(VO_SCALE) * x(VX), x(VO_SCALE) * (vl + p.vo_lever * x(WZ)));
+  };
+  VoMeas m;
+  m.R = Eigen::Matrix2d::Identity();
+  for (int i = 0; i < 2; ++i) {
+    Ekf f(p);
+    f.x = x0;
+    f.P = 1e-8 * StateMat::Identity();
+    m.z = h(x0);
+    m.z(i) += 1.0;
+    ASSERT_TRUE(f.update_vo(m));
+    const StateVec H_row = (f.x - x0) / 1e-8;
+    StateVec H_num;
+    for (int j = 0; j < NX; ++j) {
+      StateVec a = x0, b = x0;
+      a(j) += 1e-6;
+      b(j) -= 1e-6;
+      H_num(j) = (h(a)(i) - h(b)(i)) / 2e-6;
+    }
+    EXPECT_LT((H_row - H_num).cwiseAbs().maxCoeff(), 1e-3) << "row " << i;
+  }
+}
+
+TEST(EkfCore, VoJacobian) { check_vo(false); }
+TEST(EkfCore, VoJacobianLateral) { check_vo(true); }
+
+TEST(EkfCore, VoLearnsScaleAndRejectsJumps)
+{
+  // Wheels and VO see the same 2 m/s; the VO reads 6 % high: the filter learns 1.06.
+  // A VO reset (velocity jump) fails the gate.
+  EkfParams p;
+  DelayedEkf ekf(p, 1.0);
+  StateVec x0 = StateVec::Zero();
+  x0(SPEED_SCALE) = 1.0;
+  x0(VO_SCALE) = 1.0;
+  StateVec sd;
+  sd << 0.1, 0.1, 0.05, 0.03, 1.0, 0.5, 0.01, 0.01, 0.2, 2.0, 0.5, 0.05;
+  ekf.initialize(0.0, x0, sd.array().square().matrix().asDiagonal());
+  std::mt19937 rng(1);
+  std::normal_distribution<double> n(0.0, 1.0);
+  for (int i = 1; i <= 3000; ++i) {
+    const double t = 0.005 * i;
+    Measurement tw;
+    tw.t = t;
+    tw.type = Measurement::Type::TWIST;
+    tw.twist.z << 2.0 + 0.05 * n(rng), 0.01 * n(rng);
+    tw.twist.R = Eigen::Vector2d(0.1 * 0.1, 0.02 * 0.02).asDiagonal();
+    ekf.add(tw);
+    if (i % 20 == 0) {
+      Measurement vo;
+      vo.t = t;
+      vo.type = Measurement::Type::VO;
+      vo.vo.z << 1.06 * 2.0 + 0.1 * n(rng), 0.1 * n(rng);
+      vo.vo.R = 0.15 * 0.15 * Eigen::Matrix2d::Identity();
+      EXPECT_EQ(ekf.add(vo), DelayedEkf::Result::APPLIED);
+    }
+  }
+  EXPECT_NEAR(ekf.state()(VO_SCALE), 1.06, 0.02);
+  Measurement bad;
+  bad.t = 15.01;
+  bad.type = Measurement::Type::VO;
+  bad.vo.z << 4.0, 1.5;
+  bad.vo.R = 0.15 * 0.15 * Eigen::Matrix2d::Identity();
+  EXPECT_EQ(ekf.add(bad), DelayedEkf::Result::REJECTED);
+}
+
+TEST(VoVelocity, BodyVelocityFromPoses)
+{
+  // Driving a circle (v 2 m/s, w 0.5 rad/s) with the camera sliding 0.3 m/s to the left.
+  rc_localization::VoVelocity vo(0.2, 0.1);
+  double x = 0, y = 0, yaw = 3.0;   // across +-pi
+  int n_out = 0;
+  for (int i = 0; i < 300; ++i) {
+    const double t = i / 30.0;
+    VoVelocity::Out o;
+    if (vo.add(t, x, y, yaw, o)) {
+      ++n_out;
+      EXPECT_NEAR(o.v_fwd, 2.0, 0.01);
+      EXPECT_NEAR(o.v_left, 0.3, 0.01);
+    }
+    const double h = 1.0 / 30.0, ym = yaw + 0.25 * h;   // midpoint heading
+    x += h * (2.0 * std::cos(ym) - 0.3 * std::sin(ym));
+    y += h * (2.0 * std::sin(ym) + 0.3 * std::cos(ym));
+    yaw = normalize_angle(yaw + 0.5 * h);
+  }
+  EXPECT_NEAR(n_out, 100, 3);   // one per period
 }
 
 TEST(EkfCore, PositionDelayJacobian) { check_position_delay(false); }
@@ -332,7 +432,7 @@ SlipResult run_slip(bool lateral, double tau = -1.0, unsigned seed = 3)
   StateVec x0 = StateVec::Zero();
   x0(SPEED_SCALE) = 1.0;
   StateMat P0 = StateMat::Zero();
-  P0.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.1, 0.1, 1e-4, 1e-4, 0.04, 4.0, 0.25;
+  P0.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.1, 0.1, 1e-4, 1e-4, 0.04, 4.0, 0.25, 0.0025;
   ekf.initialize(0.0, x0, P0);
 
   struct Pending { double arrive; Measurement m; };
