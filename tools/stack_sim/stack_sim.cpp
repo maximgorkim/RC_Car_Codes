@@ -28,6 +28,7 @@
 //   mass=4.0 iz=0.055          kg, kg m^2 (assumed: F1TENTH-like, not identified on this car)
 //   pf_pos_extra=0.04          s the PF position is older than its heading (car_like.json; the
 //                              2026-10-05 bags fit 0 better, see ekf_replay pose_position_delay)
+//   accel_bias=0.0             m/s^2 IMU lateral accel offset (mounting tilt; the car: -0.30)
 //   glitch_rate=0 glitch_m=0.5 per-pose probability and size of a PF position jump
 //   lost_t=-1 lost_dur=3 lost_rate=0.5  PF loses track at lost_t: pose slides back at lost_rate m/s
 //   + any EKF / MPC parameter listed in apply_key() below
@@ -189,6 +190,7 @@ int main(int argc, char** argv) {
   double pose_min_xy = 0.03, pose_min_yaw = 0.015, twist_min_vx = 0.05, twist_min_wz = 0.01;
   double erpm_per_mps = 2080.0, speed_stddev = 0.1, yaw_rate_stddev = 0.02, standstill_erpm = 50.0;
   double init_yaw_bias = 0.05, max_extrapolation = 0.1, history = 1.0, output_rate = 50.0;
+  double lateral_dynamics = 0.0, accel_stddev = 1.0, init_ay_bias = 0.0, accel_bias = 0.0;
   int max_rejections = 15;
   // ------------------------------------------------------------------ MPC (mpc_car.yaml values)
   ControllerParams cp;
@@ -204,6 +206,9 @@ int main(int argc, char** argv) {
       {"ekf.pose_min_xy", &pose_min_xy}, {"ekf.pose_min_yaw", &pose_min_yaw}, {"ekf.erpm_per_mps", &erpm_per_mps},
       {"ekf.init_yaw_bias", &init_yaw_bias}, {"ekf.max_extrapolation", &max_extrapolation},
       {"ekf.output_rate", &output_rate},
+      {"ekf.lateral_dynamics", &lateral_dynamics}, {"ekf.slip_tau", &ep.slip_tau}, {"ekf.q_vy", &ep.q_vy},
+      {"ekf.q_ay", &ep.q_ay}, {"ekf.q_ay_bias", &ep.q_ay_bias}, {"ekf.accel_stddev", &accel_stddev},
+      {"ekf.init_ay_bias", &init_ay_bias}, {"accel_bias", &accel_bias},
       {"mpc.v_max", &cp.mpc.v_max}, {"mpc.a_lat_max", &cp.mpc.a_lat_max}, {"mpc.max_e_lat", &cp.mpc.max_e_lat},
       {"mpc.max_e_psi", &cp.mpc.max_e_psi}, {"mpc.control_period", &cp.control_period},
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
@@ -222,6 +227,7 @@ int main(int argc, char** argv) {
     it = kv.erase(it);
   }
 
+  ep.lateral_dynamics = lateral_dynamics != 0.0;
   cp.mpc.horizon = static_cast<int>(mpc_horizon);
   cp.grip_adaptation = grip_on != 0.0;
   // MPC exactly as mpc_node + mpc.launch.py set it up
@@ -263,7 +269,7 @@ int main(int argc, char** argv) {
       if (it->t <= tq) return *it;
     return hist.front();
   };
-  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0;
+  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0, ay_bl = 0.0;
   // dynamic plant: body velocities at the centre of gravity. Tyre data: F1TENTH single-track model
   // (C_alpha = C_S mu F_z, C_Sf 4.718, C_Sr 5.456 1/rad), scaled to this wheelbase. Mildly
   // understeering (~0.03 rad/g), i.e. kinematic at the bags' 0.1-0.3 g, as identified.
@@ -297,6 +303,7 @@ int main(int argc, char** argv) {
     x0(rl::YAW) = myaw;
     x0(rl::YAW_BIAS) = init_yaw_bias;
     x0(rl::SPEED_SCALE) = 1.0;
+    x0(rl::AY_BIAS) = init_ay_bias;
     if (ekf.initialized()) {
       for (int i : {rl::YAW_BIAS, rl::GYRO_BIAS, rl::SPEED_SCALE, rl::AY_BIAS, rl::VX, rl::WZ}) x0(i) = ekf.state()(i);
     }
@@ -307,9 +314,9 @@ int main(int argc, char** argv) {
   };
 
   // metrics
-  std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps;
+  std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps, ekf_err_slide;
   std::vector<std::vector<double>> el_lap;  // per lap (learning over laps)
-  double last_out_x = NAN, last_out_y = NAN, last_out_t = 0.0;
+  double last_out_x = NAN, last_out_y = NAN, last_out_t = 0.0, ser_ekf_err = 0.0, ser_ekf_hdg = 0.0;
   int aborts = 0;
   double last_dcmd = 0.0, s_trav = 0.0;
   std::ofstream ser;
@@ -330,6 +337,9 @@ int main(int argc, char** argv) {
     if (o.status != mpc_tc::Status::kOk) {
       if (o.status == mpc_tc::Status::kAbort) {
         ++aborts;
+        const Projection tq = truth.project(x + A * std::cos(psi), y + A * std::sin(psi), psi - heading_bias);
+        std::fprintf(stderr, "abort t=%.2f e_lat=%.3f e_psi=%.3f (truth %.3f %.3f) solver_ok=%d\n", t_arr, o.meas.e_lat,
+                     o.meas.e_psi, tq.e_lat, tq.e_psi, static_cast<int>(o.mpc.ok));
         stopped = true;  // the node disarms
       }
       pend_v = pend_d = 0.0;
@@ -386,6 +396,7 @@ int main(int argc, char** argv) {
       const double ax = (fx - fyf * std::sin(delta)) / car_mass + dvy * dr;
       const double vyd = (fyr + fyf * std::cos(delta)) / car_mass - dvx * dr;
       const double rd = (lf * fyf * std::cos(delta) - lr * fyr) / car_iz;
+      const double dvy_old = dvy;
       dvx = std::max(0.0, dvx + h * ax);
       dvy += h * vyd;
       dr += h * rd;
@@ -394,7 +405,8 @@ int main(int argc, char** argv) {
       const double r_kin = dvx * std::tan(delta) / L;
       dr = w * dr + (1.0 - w) * r_kin;
       dvy = w * dvy + (1.0 - w) * lr * r_kin;
-      ay_true = vyd + dvx * dr;
+      // from the motion actually made (the low-speed blend included), as an accelerometer sees it
+      ay_true = (dvy - dvy_old) / h + dvx * dr;
       // move the centre of gravity, keep (x, y) = rear axle as in the kinematic plant
       double cx = x + lr * std::cos(psi), cy = y + lr * std::sin(psi);
       cx += h * (dvx * std::cos(psi) - dvy * std::sin(psi));
@@ -409,6 +421,9 @@ int main(int argc, char** argv) {
       if (t > 10.0)
         beta_max = std::max(beta_max, std::fabs(std::atan2(dvy, std::max(dvx, 0.5)) - std::atan(lr * std::tan(delta) / L)));
     }
+    // lateral acceleration at base_link (where the EKF's lateral model sits)
+    const double rdot = (r - r_now) / h;
+    ay_bl = ay_true + (A - (dyn ? lr : 0.0)) * rdot;
     r_now = r;
     t += h;
     gyro_bias += gyro_bias_rw * std::sqrt(h) * N01(rng_bias);
@@ -418,10 +433,20 @@ int main(int argc, char** argv) {
     // ---------------- sensors
     if (t >= next_imu) {
       next_imu += T_imu;
-      const double wz = r + gyro_bias + gyro_std * N01(rng_imu), ay = ay_true + accel_std * N01(rng_imu);
+      const double wz = r + gyro_bias + gyro_std * N01(rng_imu), ay = ay_bl + accel_bias + accel_std * N01(rng_imu);
       const double stamp = t;
-      (void)ay;
       ctrl.on_imu(t + imu_latency, wz);  // mpc_node stamps the IMU with now() on reception
+      if (ep.lateral_dynamics) {
+        post(t + imu_latency, [&, stamp, ay] {  // ekf_localizer::on_imu
+          if (!ekf.initialized()) return;
+          rl::Measurement m;
+          m.t = stamp;
+          m.type = rl::Measurement::Type::ACCEL;
+          m.accel.z = ay;
+          m.accel.R = accel_stddev * accel_stddev;
+          ekf.add(m);
+        });
+      }
       post(t + imu_latency, [&, stamp, wz] {
         // twist_estimator: one twist per IMU message with the latest VESC speed
         if (te_vesc_stamp < 0.0 || std::fabs(stamp - te_vesc_stamp) > 0.1) return;
@@ -524,8 +549,11 @@ int main(int argc, char** argv) {
           // error of the published pose: base_link and LiDAR heading now
           const double bx = x + A * std::cos(psi), by = y + A * std::sin(psi);
           const double ex = xe(rl::X) - bx, ey = xe(rl::Y) - by;
+          ser_ekf_err = std::hypot(ex, ey);
+          ser_ekf_hdg = rl::normalize_angle(xe(rl::YAW) - (psi - heading_bias));
           if (t > 10.0) {
             ekf_pos_err.push_back(std::hypot(ex, ey));
+            if (std::fabs(slide_now) > 0.03) ekf_err_slide.push_back(std::hypot(ex, ey));
             ekf_hdg_err.push_back(rl::normalize_angle(xe(rl::YAW) - (psi - heading_bias)));
             if (!std::isnan(last_out_x)) {
               // jump: change between outputs beyond what the true motion explains
@@ -571,7 +599,7 @@ int main(int argc, char** argv) {
       if (ser) {
         const rl::StateVec xs = ekf.initialized() ? ekf.state() : rl::StateVec::Zero();
         ser << t << "," << tp.s << "," << tp.e_lat << "," << v << "," << last_dcmd << ","
-            << (ekf_pos_err.empty() ? 0.0 : ekf_pos_err.back()) << "," << (ekf_hdg_err.empty() ? 0.0 : ekf_hdg_err.back())
+            << ser_ekf_err << "," << ser_ekf_hdg
             << "," << xs(rl::GYRO_BIAS) << "," << xs(rl::YAW_BIAS) << "," << slide_now << "," << ctrl.grip() << ","
             << mu_now << "," << ay_true << "," << x + A * std::cos(psi) << "," << y + A * std::sin(psi) << ","
             << psi << "," << r_now << "\n";
@@ -603,9 +631,10 @@ int main(int argc, char** argv) {
   // one machine-readable line: key=value
   std::printf("laps=%.2f time=%.1f elat_rms=%.4f elat_max=%.4f elat_st=%.4f elat_st_mean=%.4f elat_cu=%.4f "
               "steer_std_st=%.4f ekf_err=%.4f ekf_err_max=%.4f ekf_hdg=%.4f jump_max=%.4f rejected=%d resets=%d "
-              "aborts=%d beta_max=%.4f elat_lap1=%.4f elat_last=%.4f\n",
+              "aborts=%d beta_max=%.4f elat_lap1=%.4f elat_last=%.4f ekf_err_slide=%.4f ekf_err_slide_max=%.4f slide_n=%zu\n",
               s_trav / truth.length(), t, rms(el), absmax(el), rms(el_st), mean(el_st), rms(el_cu), stdv(d_st),
               mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max, el_lap.size() > 1 ? rms(el_lap[1]) : NAN,
-              el_lap.size() > 1 ? rms(el_lap[el_lap.size() - (el_lap.back().size() < el_lap[1].size() / 2 ? 2 : 1)]) : NAN);
+              el_lap.size() > 1 ? rms(el_lap[el_lap.size() - (el_lap.back().size() < el_lap[1].size() / 2 ? 2 : 1)]) : NAN,
+              mean(ekf_err_slide), absmax(ekf_err_slide), ekf_err_slide.size());
   return 0;
 }
