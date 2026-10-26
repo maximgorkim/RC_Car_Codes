@@ -195,6 +195,7 @@ int main(int argc, char** argv) {
   double erpm_per_mps = 2080.0, speed_stddev = 0.1, yaw_rate_stddev = 0.02, standstill_erpm = 50.0;
   double init_yaw_bias = 0.05, max_extrapolation = 0.1, history = 1.0, output_rate = 50.0;
   double lateral_dynamics = 0.0, accel_stddev = 1.0, init_ay_bias = 0.0, accel_bias = 0.0;
+  double det_vslip = 0.15;  // m/s, threshold of the EKF side-slip detector evaluated alongside (det2_*)
   double vo_on = 0.0, vo_scale_true = 1.044, vo_noise = 0.015, vo_latency = 0.041, vo_stddev = 0.15;
   double init_vo_scale = 1.04, vo_window = 0.2, vo_period = 0.1;
   int max_rejections = 15;
@@ -218,13 +219,13 @@ int main(int argc, char** argv) {
       {"ekf.vo", &vo_on}, {"ekf.vo_stddev", &vo_stddev}, {"ekf.init_vo_scale", &init_vo_scale},
       {"ekf.vo_window", &vo_window}, {"ekf.vo_period", &vo_period}, {"ekf.vo_gate", &ep.vo_gate},
       {"ekf.q_vo_scale", &ep.q_vo_scale}, {"vo_scale", &vo_scale_true}, {"vo_noise", &vo_noise},
-      {"vo_latency", &vo_latency},
+      {"vo_latency", &vo_latency}, {"det_vslip", &det_vslip},
       {"mpc.v_max", &cp.mpc.v_max}, {"mpc.a_lat_max", &cp.mpc.a_lat_max}, {"mpc.max_e_lat", &cp.mpc.max_e_lat},
       {"mpc.max_e_psi", &cp.mpc.max_e_psi}, {"mpc.control_period", &cp.control_period},
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
       {"mpc.grip", &grip_on}, {"mpc.grip_margin", &cp.grip_margin}, {"mpc.grip_recover_tau", &cp.grip_recover_tau},
       {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.grip_probe_tau", &cp.grip_probe_tau}, {"mpc.grip_probe_level", &cp.grip_probe_level},
-      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.understeer", &cp.model.understeer}, {"mpc.yaw_map_bin", &cp.yaw_map_bin}, {"mpc.yaw_map_gain", &cp.yaw_map_gain}, {"mpc.understeer_tau", &cp.understeer_tau},
+      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.slip_filter_tau", &cp.slip_filter_tau}, {"mpc.understeer", &cp.model.understeer}, {"mpc.yaw_map_bin", &cp.yaw_map_bin}, {"mpc.yaw_map_gain", &cp.yaw_map_gain}, {"mpc.understeer_tau", &cp.understeer_tau},
       {"tyre_cs", &tyre_cs}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
   };
   for (auto it = kv.begin(); it != kv.end();) {
@@ -280,7 +281,7 @@ int main(int argc, char** argv) {
       if (it->t <= tq) return *it;
     return hist.front();
   };
-  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0, ay_bl = 0.0, vlat_true = 0.0;
+  double gyro_bias = gyro_bias0, v_prev = 0.0, r_now = 0.0, ay_bl = 0.0, vlat_true = 0.0, sat_now = 0.0;
   // dynamic plant: body velocities at the centre of gravity. Tyre data: F1TENTH single-track model
   // (C_alpha = C_S mu F_z, C_Sf 4.718, C_Sr 5.456 1/rad), scaled to this wheelbase. Mildly
   // understeering (~0.03 rad/g), i.e. kinematic at the bags' 0.1-0.3 g, as identified.
@@ -329,6 +330,10 @@ int main(int argc, char** argv) {
 
   // metrics
   std::vector<double> el, el_st, el_cu, d_st, ekf_pos_err, ekf_hdg_err, jumps, ekf_err_slide, vlat_err_slide;
+  // slide detection vs the truth (50 Hz): |true body slip beyond kinematic| and the controller's flag
+  std::vector<double> det_t, det_slide;
+  std::vector<int> det_flag, det_flag2;
+  double vslip_est = 0.0;  // EKF side-slip velocity (v_lat - lever_arm wz), last output
   std::vector<std::vector<double>> el_lap;  // per lap (learning over laps)
   double last_out_x = NAN, last_out_y = NAN, last_out_t = 0.0, ser_ekf_err = 0.0, ser_ekf_hdg = 0.0;
   int aborts = 0;
@@ -407,6 +412,8 @@ int main(int argc, char** argv) {
       const double fyr_max = std::sqrt(std::max(0.0, fr_max * fr_max - fx * fx));
       const double af = delta - std::atan2(dvy + lf * dr, vxs), ar = -std::atan2(dvy - lr * dr, vxs);
       const double fyf = fiala(af, tyre_cs * 4.718 * mu_now * Fzf, ff_max), fyr = fiala(ar, tyre_cs * 5.456 * mu_now * Fzr, fyr_max);
+      // tyre saturation (1 = at the friction limit): the truth for slide detection
+      sat_now = std::max(std::fabs(fyf) / std::max(ff_max, 1e-9), std::fabs(fyr) / std::max(fyr_max, 1e-9));
       const double ax = (fx - fyf * std::sin(delta)) / car_mass + dvy * dr;
       const double vyd = (fyr + fyf * std::cos(delta)) / car_mass - dvx * dr;
       const double rd = (lf * fyf * std::cos(delta) - lr * fyr) / car_iz;
@@ -583,6 +590,7 @@ int main(int argc, char** argv) {
           const double bx = x + A * std::cos(psi), by = y + A * std::sin(psi);
           const double ex = xe(rl::X) - bx, ey = xe(rl::Y) - by;
           ser_ekf_err = std::hypot(ex, ey);
+          vslip_est = ep.lateral_dynamics ? xe(rl::VY) - ep.lever_arm * xe(rl::WZ) : 0.0;
           ser_ekf_hdg = rl::normalize_angle(xe(rl::YAW) - (psi - heading_bias));
           if (t > 10.0) {
             ekf_pos_err.push_back(std::hypot(ex, ey));
@@ -634,6 +642,12 @@ int main(int argc, char** argv) {
         }
         if (std::fabs(tp.kappa) > 0.6) el_cu.push_back(tp.e_lat);
       }
+      if (t > 3.0) {
+        det_t.push_back(t);
+        det_slide.push_back(sat_now);
+        det_flag.push_back(ctrl.slipping() ? 1 : 0);
+        det_flag2.push_back(std::fabs(vslip_est) > det_vslip ? 1 : 0);
+      }
       if (ser) {
         const rl::StateVec xs = ekf.initialized() ? ekf.state() : rl::StateVec::Zero();
         ser << t << "," << tp.s << "," << tp.e_lat << "," << v << "," << last_dcmd << ","
@@ -674,6 +688,44 @@ int main(int argc, char** argv) {
               mean(ekf_pos_err), absmax(ekf_pos_err), rms(ekf_hdg_err), absmax(jumps), total_rej, resets, aborts, beta_max, el_lap.size() > 1 ? rms(el_lap[1]) : NAN,
               el_lap.size() > 1 ? rms(el_lap[el_lap.size() - (el_lap.back().size() < el_lap[1].size() / 2 ? 2 : 1)]) : NAN,
               mean(ekf_err_slide), absmax(ekf_err_slide), ekf_err_slide.size());
+  // slide detection: an episode = a tyre at >= slide_on of its friction limit for >= 0.1 s; delay from its
+  // start to the first flag (miss: none until 0.3 s after its end); false alarm = flag below slide_off
+  const double slide_on = 0.95, slide_off = 0.7;
+  auto evaluate = [&](const std::vector<int>& det_flag, const char* tag) {
+  std::vector<double> delays;
+  int n_ep = 0, n_miss = 0, n_quiet = 0, n_false = 0;
+  for (size_t i = 0; i < det_t.size();) {
+    if (det_slide[i] < slide_on) {
+      if (det_slide[i] < slide_off) {
+        ++n_quiet;
+        n_false += det_flag[i];
+      }
+      ++i;
+      continue;
+    }
+    size_t j = i;
+    while (j < det_t.size() && det_slide[j] >= slide_on) ++j;
+    if (det_t[std::min(j, det_t.size() - 1)] - det_t[i] >= 0.1) {
+      ++n_ep;
+      double d = -1.0;
+      for (size_t k = i; k < det_t.size() && det_t[k] <= det_t[std::min(j, det_t.size() - 1)] + 0.3; ++k)
+        if (det_flag[k]) {
+          d = det_t[k] - det_t[i];
+          break;
+        }
+      if (d < 0.0) ++n_miss;
+      else delays.push_back(d);
+    }
+    i = j;
+  }
+  std::sort(delays.begin(), delays.end());
+  std::printf("%s_episodes=%d %s_missed=%d %s_delay_med=%.3f %s_delay_p90=%.3f %s_false=%.4f ", tag, n_ep, tag, n_miss,
+              tag, delays.empty() ? NAN : delays[delays.size() / 2], tag,
+              delays.empty() ? NAN : delays[delays.size() * 9 / 10], tag, n_quiet ? static_cast<double>(n_false) / n_quiet : NAN);
+  };
+  evaluate(det_flag, "det");
+  evaluate(det_flag2, "det2");
+  std::printf("\n");
   // second line: side slip estimate (vlat_err_slide) and the visual odometry
   std::printf("vlat_err_slide=%.4f vo_rejected=%d vo_scale_est=%.4f\n", rms(vlat_err_slide), vo_rej,
                 ekf.initialized() ? ekf.state()(rl::VO_SCALE) : NAN);
