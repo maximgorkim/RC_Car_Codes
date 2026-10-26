@@ -117,10 +117,10 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
     qp_.reset_duals();
     have_nominal_ = true;
   }
-  const Eigen::Vector4d q_st(dt / (set_.max_e_lat * set_.max_e_lat), dt / (set_.max_e_psi * set_.max_e_psi),
-                             dt / (set_.max_e_v * set_.max_e_v), 0.0);
+  const Eigen::Vector4d q_st(set_.w_lat * dt / (set_.max_e_lat * set_.max_e_lat),
+                             set_.w_psi * dt / (set_.max_e_psi * set_.max_e_psi), dt / (set_.max_e_v * set_.max_e_v), 0.0);
   const Eigen::Vector2d r_rate(dt / (set_.max_v_rate * set_.max_v_rate * dt * dt),
-                               dt / (set_.max_delta_rate * set_.max_delta_rate * dt * dt));
+                               set_.w_drate * dt / (set_.max_delta_rate * set_.max_delta_rate * dt * dt));
   MpcResult out;
   for (int it = 0; it < std::max(1, set_.sqp_iterations); ++it) {
     rollout(x0, s0, path, v_prev);
@@ -174,6 +174,19 @@ MpcResult TrackingMpc::solve(const Eigen::Vector4d& x0, double s0, double v_ref,
       }
     q_[0] -= r_rate[0] * v_prev;
     q_[1] -= r_rate[1] * d_prev;
+    if (set_.env_weight > 0.0 && set_.grip_accel > 0.0) {
+      for (int k = 0; k < N_; ++k) {
+        const double vk = std::max(xn_[k][2], 0.5);
+        const double lim = std::atan(set_.env_factor * set_.grip_accel * mod_.wheelbase *
+                                     (1.0 + mod_.understeer * vk * vk) / (vk * vk));
+        const double dk = u_nom_[2 * k + 1];
+        if (std::fabs(dk) > lim) {  // active: pull towards the bound
+          const int i = 2 * k + 1;
+          P_(i, i) += set_.env_weight;
+          q_[i] -= set_.env_weight * std::copysign(lim, dk);
+        }
+      }
+    }
     P_ *= 2.0;
     q_ *= 2.0;
     P_.diagonal().array() += 1e-9;
@@ -394,6 +407,15 @@ void TrackingController::update_grip(double t_arr) {
   if (p_.grip_adaptation) {
     const double g = p_.grip_margin * grip_ * 9.81;
     mpc_.set_grip_limits(std::min(p_.mpc.a_lat_max, g), std::min(p_.mpc.v_rate_max, g * p_.mpc.drive_axle_load), g);
+    if (p_.recovery_lat > 0.0) {
+      // recovery phase: full while sliding (and recovery_hold after), then back with recovery_tau
+      since_slip_ = slipping_ ? 0.0 : since_slip_ + dt;
+      if (since_slip_ <= p_.recovery_hold) recovery_ = 1.0;
+      else recovery_ *= std::exp(-dt / p_.recovery_tau);
+      // geometric blend: the multiplier moves smoothly between 1 and the recovery value
+      auto blend = [&](double m) { return std::pow(m, recovery_); };
+      mpc_.set_weight_scales(blend(p_.recovery_lat), blend(p_.recovery_psi), blend(p_.recovery_drate));
+    }
   }
   const double t1 = t_arr - 0.05, t0 = t1 - 0.1, tm = 0.5 * (t0 + t1);
   double r = 0.0;

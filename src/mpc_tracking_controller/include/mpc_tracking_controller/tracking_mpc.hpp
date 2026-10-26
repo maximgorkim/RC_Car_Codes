@@ -59,6 +59,14 @@ struct MpcSettings {
   // out of a corner on a slippery floor otherwise spends the rear grip on traction and spins.
   double grip_accel = 0.0;
   double drive_axle_load = 0.5;
+  // run-time multipliers of the lateral-error, heading-error and steering-rate weights (1 = the
+  // configured Bryson weights; the slide recovery phase changes them, TrackingParams::recovery_*)
+  double w_lat = 1.0, w_psi = 1.0, w_drate = 1.0;
+  // Soft yaw-rate envelope (with the friction circle on): the predicted yaw rate v tan(d) / (L (1 + k v^2))
+  // above env_factor * grip_accel / v costs env_weight (delta beyond the bound)^2, one-sided, linearised at
+  // the previous solution (Beal & Gerdes 2013: |r| <= mu g / v; soft as in Brown et al. 2016). 0 = off.
+  double env_weight = 0.0;
+  double env_factor = 1.25;   // grip_accel = grip_margin (0.8) x grip: 1.25 puts the bound at the estimate
   int sqp_iterations = 1;      // 1 = real-time iteration
   QpSettings qp;
 };
@@ -89,6 +97,11 @@ class TrackingMpc {
   void set_understeer(double k) { mod_.understeer = k; }
   // yaw-rate disturbance along the path (arc length -> rad/s); empty = none
   void set_yaw_disturbance(std::function<double(double)> d) { yaw_dist_ = std::move(d); }
+  void set_weight_scales(double lat, double psi, double drate) {
+    set_.w_lat = lat;
+    set_.w_psi = psi;
+    set_.w_drate = drate;
+  }
   void set_grip_limits(double a_lat_max, double v_rate_max, double grip_accel) {
     set_.a_lat_max = a_lat_max;
     set_.v_rate_max = v_rate_max;
@@ -175,6 +188,16 @@ struct ControllerParams {
   // grip_recover_tau). If it was not back the next slide pulls it down again within ~0.1 s.
   double grip_probe_level = 0.6;
   double grip_probe_tau = 5.0;    // s (stack_sim wet stretch: 2 s crashed 3-5/16 on re-entry, 5 s 0/16)
+  // Slide recovery phase (with grip_adaptation): while a slide is detected the MPC stops chasing the
+  // lateral error (that turn-in asks the saturated tyres for more and spins the car) and weighs the
+  // heading and a quick steering response instead; after the slide the weights blend back with
+  // recovery_tau. As the context-dependent cost of Raji et al. (IROS 2026) and the priority
+  // stability > tracking of Brown et al. (2016). recovery_lat 0 = off.
+  double recovery_lat = 0.0;      // lateral-error weight multiplier while sliding, e.g. 0.1
+  double recovery_psi = 1.0;      // heading-error weight multiplier while sliding
+  double recovery_drate = 1.0;    // steering-rate weight multiplier while sliding (< 1: faster countersteer)
+  double recovery_hold = 0.3;     // s the recovery weights stay after the slide flag drops
+  double recovery_tau = 0.5;      // s, blend back to the normal weights
   // Online understeer estimate (model.understeer) from yaw rate vs steering while gripping, low-passed
   // with this time constant [s]; 0 = off. Saturation is then judged against the learned model, so
   // the tyres' normal (linear) understeer is not taken for a slide.
@@ -218,6 +241,7 @@ class TrackingController {
   double eff_to_steer(double d_eff) const;
   double steer_offset() const { return steer_offset_; }
   double grip() const { return grip_; }  // g, current estimate (grip_nominal when off)
+  double recovery() const { return recovery_; }  // 0 normal .. 1 slide recovery weights
   double understeer() const { return understeer_; }
   bool slipping() const { return slipping_; }
 
@@ -241,6 +265,7 @@ class TrackingController {
   double yaw_map_at(double s) const;
   double rf_ = 0.0, rmf_ = 0.0, last_imu_t_ = -1.0, slip_time_ = 0.0;
   bool slipping_ = false;
+  double recovery_ = 0.0, since_slip_ = 1e9;
   void detect_slip(double t, double r);
   double yaw_rate_of(double v, double delta) const;
   void update_grip(double t_arr);

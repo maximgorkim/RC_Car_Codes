@@ -42,6 +42,11 @@ def setup(context):
     # wet / dusty floor: slide detection + grip-limited MPC (config grip.*)
     if LaunchConfiguration("slippery").perform(context) == "true":
         over["grip.adaptation"] = True
+    # reaction to a detected slide (with slippery:=true): stop chasing the lateral error while sliding,
+    # soft yaw-rate envelope from the grip estimate
+    if LaunchConfiguration("slip_recovery").perform(context) == "true":
+        over["grip.recovery.lat"] = 0.3
+        over["grip.envelope.weight"] = 10.0
     if LaunchConfiguration("understeer_learning").perform(context) == "true":
         over["understeer.tau"] = 5.0
     for name in ("v_max", "a_lat_max"):  # optional overrides of the config's speed limits
@@ -72,6 +77,8 @@ def generate_launch_description():
                               description="true with particle_filter scan_sync:=true (latency from the pose stamp)"),
         DeclareLaunchArgument("slippery", default_value="false",
                               description="true on a wet / dusty floor: slide detection, grip-limited MPC"),
+        DeclareLaunchArgument("slip_recovery", default_value="false",
+                              description="with slippery:=true: slide recovery weights + soft yaw-rate envelope"),
         DeclareLaunchArgument("understeer_learning", default_value="false",
                               description="true: learn the understeer online (model.understeer)"),
         DeclareLaunchArgument("v_max", default_value="", description="m/s, override the config's speed limit"),

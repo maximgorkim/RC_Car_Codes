@@ -225,7 +225,10 @@ int main(int argc, char** argv) {
       {"mpc.heading_bias", &cp.heading_bias}, {"mpc.dt", &cp.mpc.dt}, {"mpc.steer_offset_tau", &cp.steer_offset_tau},
       {"mpc.grip", &grip_on}, {"mpc.grip_margin", &cp.grip_margin}, {"mpc.grip_recover_tau", &cp.grip_recover_tau},
       {"mpc.slip_rel", &cp.slip_rel}, {"mpc.slip_abs", &cp.slip_abs}, {"mpc.grip_probe_tau", &cp.grip_probe_tau}, {"mpc.grip_probe_level", &cp.grip_probe_level},
-      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.slip_filter_tau", &cp.slip_filter_tau}, {"mpc.understeer", &cp.model.understeer}, {"mpc.yaw_map_bin", &cp.yaw_map_bin}, {"mpc.yaw_map_gain", &cp.yaw_map_gain}, {"mpc.understeer_tau", &cp.understeer_tau},
+      {"mpc.slip_min_time", &cp.slip_min_time}, {"mpc.slip_filter_tau", &cp.slip_filter_tau},
+      {"mpc.recovery_lat", &cp.recovery_lat}, {"mpc.recovery_psi", &cp.recovery_psi}, {"mpc.recovery_drate", &cp.recovery_drate},
+      {"mpc.recovery_hold", &cp.recovery_hold}, {"mpc.recovery_tau", &cp.recovery_tau},
+      {"mpc.env_weight", &cp.mpc.env_weight}, {"mpc.env_factor", &cp.mpc.env_factor}, {"mpc.understeer", &cp.model.understeer}, {"mpc.yaw_map_bin", &cp.yaw_map_bin}, {"mpc.yaw_map_gain", &cp.yaw_map_gain}, {"mpc.understeer_tau", &cp.understeer_tau},
       {"tyre_cs", &tyre_cs}, {"mpc.horizon", &mpc_horizon}, {"mpc.speed_cmd_per_mps", &speed_cmd_per_mps},
   };
   for (auto it = kv.begin(); it != kv.end();) {

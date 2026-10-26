@@ -12,7 +12,8 @@
 //        servo_topic       std_msgs/Float64         servo_center + delta * servo_per_rad (clamped)
 //        /mpc/state        std_msgs/Float64MultiArray  [pose stamp, e_lat, e_psi, x0 (4), s0, v_ref,
 //                                                   v_cmd, delta_cmd, solve ms, QP iterations, converged,
-//                                                   steering offset, grip [g], slipping, understeer]
+//                                                   steering offset, grip [g], slipping, understeer,
+//                                                   slide recovery 0..1]
 // One control step per pose message (decimated to control_period).
 #include <algorithm>
 #include <chrono>
@@ -92,6 +93,13 @@ class MpcNode : public rclcpp::Node {
     p.slip_min_time = D("grip.slip_min_time", p.slip_min_time);
     p.grip_probe_level = D("grip.probe_level", p.grip_probe_level);
     p.grip_probe_tau = D("grip.probe_tau", p.grip_probe_tau);
+    p.recovery_lat = D("grip.recovery.lat", p.recovery_lat);
+    p.recovery_psi = D("grip.recovery.psi", p.recovery_psi);
+    p.recovery_drate = D("grip.recovery.drate", p.recovery_drate);
+    p.recovery_hold = D("grip.recovery.hold", p.recovery_hold);
+    p.recovery_tau = D("grip.recovery.tau", p.recovery_tau);
+    p.mpc.env_weight = D("grip.envelope.weight", p.mpc.env_weight);
+    p.mpc.env_factor = D("grip.envelope.factor", p.mpc.env_factor);
     p.model.understeer = D("model.understeer", p.model.understeer);
     p.understeer_tau = D("understeer.tau", p.understeer_tau);
     p.understeer_max = D("understeer.max", p.understeer_max);
@@ -277,7 +285,7 @@ class MpcNode : public rclcpp::Node {
     std_msgs::msg::Float64MultiArray st;
     st.data = {stamp, o.meas.e_lat, o.meas.e_psi, o.x0[0], o.x0[1], o.x0[2], o.x0[3], o.s0, v_ref,
                o.v_cmd, o.delta_cmd, ms, static_cast<double>(o.mpc.qp_iterations), o.mpc.qp_converged ? 1.0 : 0.0, ctrl_->steer_offset(),
-               ctrl_->grip(), ctrl_->slipping() ? 1.0 : 0.0, ctrl_->understeer()};
+               ctrl_->grip(), ctrl_->slipping() ? 1.0 : 0.0, ctrl_->understeer(), ctrl_->recovery()};
     pub_state_->publish(st);
   }
 
